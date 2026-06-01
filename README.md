@@ -379,12 +379,11 @@ datagrams from an unbound peer are dropped.
 
 `--acl=PATH` applies a stateless L3/L4 access-control list (MAC / CIDR / proto /
 port, per direction) to guest traffic, filtered in the daemon itself — no `pf`,
-no per-guest setup. Policy is authored in HCL and compiled to JSON by the
-`contrib/hcl2acl` helper:
+no per-guest setup. Policy is written in HCL and read directly (a `.json` path
+is accepted too); add `--stateful` to allow return traffic of permitted flows:
 
 ```bash
-go run ./contrib/hcl2acl example.hcl > example.acl.json
-socket_vmnet --acl=example.acl.json /var/run/socket_vmnet
+socket_vmnet --acl=example.hcl --stateful /var/run/socket_vmnet
 ```
 
 See [`ACL.md`](./ACL.md) for the schema, examples, and limitations.

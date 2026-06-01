@@ -22,6 +22,7 @@
 #include "cli.h"
 #include "conntrack.h"
 #include "forward.h"
+#include "hcl.h"
 #include "log.h"
 
 #if __MAC_OS_X_VERSION_MAX_ALLOWED < 101500
@@ -101,6 +102,15 @@ struct state {
   // Optional connection tracker (--stateful). NULL = stateless.
   struct conntrack *ct;
 } _state;
+
+// Load an ACL from a file, choosing the format by extension: a `.hcl` path is
+// compiled by the built-in HCL parser, anything else is parsed as JSON.
+static struct acl *load_acl_file(const char *path) {
+  size_t n = strlen(path);
+  if (n >= 4 && strcmp(path + n - 4, ".hcl") == 0)
+    return hcl_load(path);
+  return acl_load(path);
+}
 
 // Decide whether a frame is permitted by the ACL, consulting the connection
 // tracker first so that return traffic of an allowed flow passes. Safe to call
@@ -648,7 +658,7 @@ int main(int argc, char *argv[]) {
     INFOF("%s", "Guest-to-guest isolation is enabled (--isolated)");
   }
   if (cliopt->acl_path != NULL) {
-    state.acl = acl_load(cliopt->acl_path);
+    state.acl = load_acl_file(cliopt->acl_path);
     if (state.acl == NULL) {
       // Error already logged. Fail closed: refuse to start rather than run
       // unfiltered when an ACL was explicitly requested.
@@ -707,7 +717,7 @@ int main(int argc, char *argv[]) {
         // Hot-reload the ACL; keep the old ruleset (and connection state) if the
         // new file fails to parse.
         INFOF("%s", "Received SIGHUP, reloading ACL");
-        struct acl *fresh = acl_load(cliopt->acl_path);
+        struct acl *fresh = load_acl_file(cliopt->acl_path);
         if (fresh != NULL) {
           dispatch_semaphore_wait(state.sem, DISPATCH_TIME_FOREVER);
           struct acl *old = state.acl;

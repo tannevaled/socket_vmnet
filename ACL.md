@@ -13,19 +13,22 @@ Filtering is **stateless by default** (each frame judged on its own); pass
 allowed flow is permitted automatically (see [Stateful mode](#stateful-mode---stateful)).
 Both IPv4 and IPv6 are matched.
 
-## Authoring: HCL → JSON
+## Authoring: HCL
 
-Write policy in HCL and compile it to the JSON the daemon loads, using the
-`contrib/hcl2acl` helper:
+The daemon reads HCL directly -- pass a `.hcl` path to `--acl` and the built-in
+parser compiles it (a `.json` path is parsed as JSON instead):
 
 ```console
-$ go run ./contrib/hcl2acl example.hcl > example.acl.json
-$ sudo socket_vmnet --acl=example.acl.json --interface-per-vm /var/run/socket_vmnet
+$ sudo socket_vmnet --acl=example.hcl --interface-per-vm /var/run/socket_vmnet
 ```
 
-HCL groups VMs by MAC and lets you attach rules to a group; the helper expands
-each group rule over its members into flat, MAC-matched rules (egress rules bind
-to the member's source MAC, ingress rules to the destination MAC):
+(The `contrib/hcl2acl` Go helper, which emits the JSON form, remains available
+for pipelines that prefer to pre-compile: `go run ./contrib/hcl2acl example.hcl
+> example.acl.json`. It is no longer required at runtime.)
+
+HCL groups VMs by MAC and lets you attach rules to a group; each group rule is
+expanded over its members into flat, MAC-matched rules (egress rules bind to the
+member's source MAC, ingress rules to the destination MAC):
 
 ```hcl
 default_action = "allow"
