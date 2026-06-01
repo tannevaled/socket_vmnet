@@ -68,6 +68,14 @@ static void print_usage(const char *argv0) {
          "guests can still reach the\n");
   printf("                                    gateway/NAT but cannot see each "
          "other\n");
+  printf("--interface-per-vm                  start a dedicated vmnet interface "
+         "per client so that\n");
+  printf("                                    vmnet.framework performs the L2 "
+         "switching (Phase 2)\n");
+  printf("--socket-dgram=SOCKET               additional header-less "
+         "SOCK_DGRAM endpoint for\n");
+  printf("                                    QEMU `-netdev dgram` and VZ "
+         "(Phase 0)\n");
   printf("-h, --help                          display this help and exit\n");
   printf("-v, --version                       display version information and "
          "exit\n");
@@ -88,6 +96,8 @@ enum {
   CLI_OPT_VMNET_NAT66_PREFIX,
   CLI_OPT_VMNET_NETWORK_IDENTIFIER,
   CLI_OPT_ISOLATED,
+  CLI_OPT_INTERFACE_PER_VM,
+  CLI_OPT_SOCKET_DGRAM,
 };
 
 struct cli_options *cli_options_parse(int argc, char *argv[]) {
@@ -108,6 +118,8 @@ struct cli_options *cli_options_parse(int argc, char *argv[]) {
       {"vmnet-nat66-prefix",       required_argument, NULL, CLI_OPT_VMNET_NAT66_PREFIX      },
       {"vmnet-network-identifier", required_argument, NULL, CLI_OPT_VMNET_NETWORK_IDENTIFIER},
       {"isolated",                 no_argument,       NULL, CLI_OPT_ISOLATED                },
+      {"interface-per-vm",         no_argument,       NULL, CLI_OPT_INTERFACE_PER_VM        },
+      {"socket-dgram",             required_argument, NULL, CLI_OPT_SOCKET_DGRAM            },
       {"pidfile",                  required_argument, NULL, 'p'                             },
       {"help",                     no_argument,       NULL, 'h'                             },
       {"version",                  no_argument,       NULL, 'v'                             },
@@ -160,6 +172,12 @@ struct cli_options *cli_options_parse(int argc, char *argv[]) {
       break;
     case CLI_OPT_ISOLATED:
       res->isolated = true;
+      break;
+    case CLI_OPT_INTERFACE_PER_VM:
+      res->interface_per_vm = true;
+      break;
+    case CLI_OPT_SOCKET_DGRAM:
+      res->socket_dgram_path = strdup(optarg);
       break;
     case 'p':
       res->pidfile = strdup(optarg);
@@ -258,5 +276,6 @@ void cli_options_destroy(struct cli_options *x) {
   free(x->vmnet_mask);
   free(x->vmnet_nat66_prefix);
   free(x->pidfile);
+  free(x->socket_dgram_path);
   free(x);
 }

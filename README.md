@@ -328,6 +328,53 @@ Make sure to specify unique MAC addresses to VMs: `-device virtio-net-pci,netdev
 NOTE: don't confuse MAC addresses of VMs with the MAC address of `socket_vmnet` itself that is printed as `vmnet_mac_address` in the debug log.
 You do not need to configure (and you can't, currently) the MAC address of `socket_vmnet` itself.
 
+By default, frames received from `vmnet` are switched to the single client that
+owns the destination MAC (learned from the guests' egress frames); only
+multicast, broadcast, and not-yet-learned unicast are flooded. This avoids
+copying every packet to every VM.
+
+### Guest isolation
+
+`--isolated` prevents guests from talking to each other directly. They keep full
+access to the gateway/NAT (and the outside world), but cannot see one another:
+
+```bash
+socket_vmnet --vmnet-gateway=192.168.105.1 --isolated /var/run/socket_vmnet
+```
+
+With `--interface-per-vm` (below), `--isolated` is enforced by vmnet.framework's
+own isolation key (hard, non-spoofable, requires macOS 11+) rather than in
+userspace.
+
+### One interface per VM
+
+`--interface-per-vm` starts a dedicated `vmnet` interface for each client, so
+that vmnet.framework performs the L2 switching itself. This removes the
+userspace fan-out entirely and scales better with many VMs:
+
+```bash
+socket_vmnet --vmnet-gateway=192.168.105.1 --interface-per-vm /var/run/socket_vmnet
+```
+
+NOTE: each interface consumes a software bridge and a DHCP lease; vmnet limits
+the number of interfaces per host.
+
+### Datagram transport (QEMU `-netdev dgram` / Apple Virtualization.framework)
+
+`--socket-dgram=PATH` opens an additional header-less `SOCK_DGRAM` endpoint, in
+addition to the positional length-prefixed stream socket. One datagram is one
+ethernet frame, which is the format used by QEMU 7.2+ `-netdev dgram` and by
+Apple's `VZFileHandleNetworkDeviceAttachment`:
+
+```bash
+socket_vmnet --vmnet-gateway=192.168.105.1 \
+  --socket-dgram=/var/run/socket_vmnet.dgram \
+  /var/run/socket_vmnet
+```
+
+The client must `bind(2)` a local address so that replies can be delivered;
+datagrams from an unbound peer are dropped.
+
 ### Bridged mode
 
 See [`./launchd/io.github.lima-vm.socket_vmnet.bridged.en0.plist`](./launchd/io.github.lima-vm.socket_vmnet.bridged.en0.plist).

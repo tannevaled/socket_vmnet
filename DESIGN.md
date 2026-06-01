@@ -1,150 +1,146 @@
-# Design: per-VM isolation and a datagram fast path
+# Design: per-VM isolation and a datagram transport
 
 This document describes the redesign that addresses
 [lima-vm/socket_vmnet#77][issue-77] ("Consider one vmnet interface per VM,
 datagram-based interface"), and the adjacent issues
-[#58][issue-58] (performance) and [#13][issue-13]
+[#58][issue-58] (bad scaling due to flooding) and [#13][issue-13]
 (`VZFileHandleNetworkDeviceAttachment` support).
 
-It is staged in three phases so that each step is independently reviewable and
-shippable. **Phase 1 is implemented in this branch and builds cleanly. Phases 0
-and 2 are specified here as the agreed design target and are not yet
-implemented.**
+It is organized in three phases. **All three are now implemented in this
+branch and build cleanly with `-Wall -Wextra -pedantic` + `clang-format`.**
+None of it has been exercised at runtime yet: `vmnet` is gated behind SIP and
+requires an Apple-Developer-signed binary, so the behavior must be validated on
+real, code-signed macOS hardware (see [Validation](#validation)).
 
 ## Problem
 
 `socket_vmnet` runs a single shared `vmnet` interface and multiplexes every
-connected client (QEMU / VZ guest) onto it. Two consequences fall out of that
-design:
+connected client onto it. Three costs follow:
 
-1. **Flooding / performance.** Every frame received from `vmnet`, and every
-   frame sent by a guest, is copied to *all* connected clients. With N guests
-   this is O(N) duplication per packet, and guests receive traffic that is not
-   addressed to them. See the two `// FIXME: avoid flooding` sites in the
-   pre-existing `main.c`.
-2. **No isolation.** Because all guests sit on one shared L2 segment and the
-   daemon floods between them, any guest can observe (and inject into) another
-   guest's traffic. There is no way to run mutually untrusting guests.
+1. **Flooding / scaling ([#58][issue-58]).** Every frame from `vmnet`, and every
+   frame a guest sends, is copied to *all* clients — O(N) duplication, and idle
+   guests burn CPU dropping traffic that is not theirs. Measured: throughput
+   collapses from 3.52 Gbps (1 VM) to 0.81 Gbps (4 VMs); ~145% of 437% CPU is
+   spent on unrelated packets.
+2. **No isolation.** All guests share one L2 segment and the daemon floods
+   between them, so any guest can observe/inject another guest's traffic.
+3. **Transport tax.** The legacy QEMU stream protocol length-prefixes each
+   packet (`uint32be`), forcing two `read(2)`s per packet. That same header is
+   why Apple's `VZFileHandleNetworkDeviceAttachment` (header-less datagrams) is
+   incompatible today ([#13][issue-13]).
 
-The transport itself adds a third cost: the QEMU stream protocol frames each
-packet with a `uint32be` length header, forcing two `read(2)`s per packet and
-preventing vectorized I/O.
+## Phase 1 — switched forwarding + userspace isolation
 
-## Goals
+Turns the daemon's fan-out into a learning ethernet switch.
 
-- Stop flooding: deliver unicast frames only to the client that owns the
-  destination MAC.
-- Offer real isolation between guests as an opt-in.
-- Provide a header-less datagram transport that serves both modern QEMU
-  (`-netdev dgram`, 7.2+) and Apple's `VZFileHandleNetworkDeviceAttachment`
-  without a wrapper, and that allows `recvmmsg(2)`/`sendmmsg(2)` batching.
-- Keep full backward compatibility with the existing `unix://` stream protocol.
+- `struct conn` learns its source MAC (`mac[6]` + `mac_known`), filling the
+  pre-existing `// TODO: uint8_t mac[6];`.
+- `conn_learn_mac()` records `src_mac -> connection` on every guest egress frame.
+- Both forwarding paths (`vmnet -> clients` and guest-to-guest) now flood
+  multicast/broadcast, switch known unicast to the single owning connection, and
+  flood unknown unicast until the MAC is learned — standard switch behavior,
+  factored into `forward_guest_to_guest()`.
+- `--isolated` disables direct guest-to-guest delivery; guests still reach the
+  gateway/NAT (that traffic flows through `vmnet_write` and the `vmnet ->
+  clients` path) but cannot see each other.
 
-## Phase 0 — datagram transport (not yet implemented)
+Removes the O(N) duplication of [#58][issue-58] without changing the wire
+protocol or the single-interface model. MAC learning is **spoofable**; hard
+isolation is Phase 2. The MAC lookup is O(N) (matching the existing
+`// TODO: avoid O(N) lookup`); a MAC-keyed hash table is an obvious follow-up.
 
-Add a datagram endpoint alongside the existing stream socket, e.g.
+## Phase 0 — datagram transport
 
-```
-socket_vmnet --vmnet-mode=shared \
-  unix:///var/run/socket_vmnet \           # legacy QEMU stream (length-prefixed)
-  unixgram:///var/run/socket_vmnet.dgram   # QEMU -netdev dgram + VZ file handle
-```
+A second, header-less endpoint selected with `--socket-dgram=PATH`, alongside
+the positional `SOCK_STREAM` socket (which keeps the legacy protocol).
 
 - One datagram == one ethernet frame, **no `uint32be` length header**. This is
-  exactly what `VZFileHandleNetworkDeviceAttachment` expects (the header
-  mismatch is the blocker reported in [#13][issue-13]) and what QEMU's
-  `-netdev dgram` speaks.
-- The hot path uses `recvmmsg`/`sendmmsg` to batch, mirroring the existing
-  `vmnet_read`/`vmnet_write` batching (`MAX_PACKET_COUNT_AT_ONCE`).
-- The stream protocol (`unix://`) stays the default and is untouched, so
-  existing QEMU `-netdev socket` users are unaffected.
+  what `VZFileHandleNetworkDeviceAttachment` expects (resolving the [#13][issue-13]
+  mismatch) and what QEMU's `-netdev dgram` (7.2+) speaks.
+- Model: the daemon `bind(2)`s one `SOCK_DGRAM` unix socket and tracks peers by
+  their bound address. `recvfrom` learns the peer; `sendto` replies. A `struct
+  conn` is created lazily per distinct peer (`TRANSPORT_DGRAM`), and rides the
+  same MAC-switch and per-VM-interface machinery as stream connections.
+- Datagrams are drained inline in the main `kqueue` loop (`on_dgram_readable`),
+  single-threaded, so a peer's frames keep their order.
 
-This converges with the dual-socket proposal in [#13][issue-13].
+> **No `recvmmsg`/`sendmmsg`.** Those are Linux-only; macOS/BSD lack them. The
+> datagram win here is the elimination of the length header (one `recvfrom` per
+> frame instead of two `read`s), not vectorized batching. `vmnet_read`/
+> `vmnet_write` still batch on the framework side.
 
-## Phase 1 — switched forwarding + isolation (implemented in this branch)
+### Limitations
 
-Turn the daemon's fan-out into a learning ethernet switch.
+- **Clients must bind a local address.** Replies use `sendto` to the peer's
+  address; datagrams from an unbound peer are dropped with a warning. QEMU
+  `-netdev dgram,local.type=unix,...` and a VZ launcher both bind.
+- **No per-peer teardown.** Datagram sockets have no EOF, so a `conn` persists
+  until daemon shutdown (no idle GC yet). Fine for the common one-peer-per-socket
+  case; an idle-timeout reaper is a follow-up.
+- The positional stream socket is still required even for datagram-only use.
 
-- `struct conn` gains a learned source MAC (`uint8_t mac[6]` + `mac_known`),
-  filling the pre-existing `// TODO: uint8_t mac[6];`.
-- On each frame a guest sends, the daemon learns `src_mac -> connection`
-  (`conn_learn_mac`).
-- Forwarding decisions (both `vmnet -> sockets` and `socket -> sockets`):
-  - **multicast/broadcast** (`mac[0] & 0x01`) → flood;
-  - **known unicast** → switch to the single owning connection;
-  - **unknown unicast** → flood until the MAC is learned (standard switch
-    behavior).
-- `--isolated` disables direct guest-to-guest delivery entirely. Guests still
-  reach the gateway/NAT and the outside world (that traffic flows through
-  `vmnet_write` / the `vmnet -> sockets` path), but they cannot see each other.
-  This is a userspace isolation knob and does **not** depend on macOS 11+ or on
-  the `vmnet` isolation key (see Phase 2).
+## Phase 2 — one vmnet interface per VM
 
-This removes the O(N) duplication of [#58][issue-58] and gives a first,
-spoofable-but-useful isolation option, without changing the wire protocol or
-the single-interface model.
+Enabled with `--interface-per-vm`. Instead of one shared interface,
+`vmnet_start_interface` is called **once per client** (`start_conn_interface`),
+each with its own random `vmnet_interface_id`.
 
-### Limitations of Phase 1
+- `vmnet.framework` then performs the L2 switching itself and delivers to each
+  interface only the frames addressed to its MAC (plus broadcast/multicast). The
+  per-interface packets-available callback forwards straight to that one client
+  (`_on_vmnet_packets_available(..., only)`), so there is **no userspace
+  fan-out and no shared connection-list lock on the hot path** — this is what
+  removes the [#58][issue-58] scaling collapse at its root.
+- `--isolated` + `--interface-per-vm` sets the framework's
+  [`vmnet_enable_isolation_key`][isolation-key] per interface: hard,
+  non-spoofable isolation enforced by the kernel.
+- Composes with both transports (a stream or datagram client each gets its own
+  interface).
 
-- MAC learning is **spoofable**: a malicious guest can forge a source MAC to
-  hijack another guest's traffic or evade `--isolated` only insofar as it can
-  reach `vmnet`'s own switching. `--isolated` blocks the daemon-level
-  guest-to-guest path, but hard, non-spoofable isolation belongs to the
-  framework (Phase 2).
-- The MAC table lookup is O(N) per frame (matching the pre-existing
-  `// TODO: avoid O(N) lookup`). A hash table keyed by MAC is the obvious
-  follow-up; N is small in practice (one entry per guest).
-- Forwarding now holds `state->sem` across the `writev`. This is correct (it
-  closes a pre-existing race where the connection list was iterated after the
-  lock was released) but serializes sends; the datagram fast path (Phase 0) and
-  a finer-grained lock are the performance follow-ups.
+### Caveats to validate on hardware
 
-## Phase 2 — one vmnet interface per VM (not yet implemented)
+- **macOS 11+.** `vmnet_enable_isolation_key` exists only on macOS 11+. The
+  symbol is referenced unconditionally; on 10.15 (still the project's stated
+  floor) the dynamic loader may refuse the binary. Weak-linking the symbol, or
+  raising the minimum to 11, is a required follow-up before merge.
+- **Scaling.** N interfaces == N software bridges + N DHCP leases. `vmnet` caps
+  the number of interfaces; measure the ceiling and per-interface overhead, and
+  cap with a fallback to Phase 1.
+- **`isolated=on` conflict.** Mixing isolated and non-isolated interfaces on one
+  sharing service has been observed to fail with *"conflict, sharing service is
+  in use"* ([utmapp/UTM#4520][utm-4520]). Treat isolation as a daemon-wide
+  choice, not an arbitrary per-VM mix; verify empirically.
+- **Teardown on signal.** Per-VM interfaces of still-active stream clients are
+  reclaimed by the OS on process exit (their reader threads are blocked in
+  `read`); the common path (client disconnect) stops the interface in
+  `on_accept`. Graceful per-connection teardown on `SIGTERM` is a follow-up.
 
-The structural fix requested in [#77][issue-77]: call `vmnet_start_interface`
-**once per client** instead of sharing one interface.
+## How the pieces compose
 
-- `vmnet.framework` then performs the L2 switching itself, and only delivers to
-  each interface the frames addressed to its MAC (plus broadcast/multicast).
-  This eliminates userspace fan-out entirely.
-- Hard isolation becomes available via the framework's
-  [`vmnet_enable_isolation_key`][isolation-key] set per interface (macOS 11+),
-  which is not spoofable.
-- Combine with a small handshake that passes a dedicated datagram fd per client:
+| transport / mode | shared interface (default) | `--interface-per-vm` |
+| --- | --- | --- |
+| `unix://` stream | Phase 1 switched forwarding | Phase 2, per-client iface |
+| `--socket-dgram` | Phase 0 + Phase 1 switch | Phase 0 + Phase 2 |
+| `--isolated` | userspace block (spoofable) | framework isolation key (hard) |
 
-  ```
-  1. client -> control socket (SOCK_SEQPACKET): REQUEST { isolated?, mac? }
-  2. daemon: vmnet_start_interface(...) -> MAC, subnet, MTU, DHCP IP, gateway/DNS
-  3. daemon -> client: METADATA + per-VM datagram fd (via SCM_RIGHTS)
-  4. client wires the fd into QEMU `-netdev dgram,fd=` or
-     VZ `VZFileHandleNetworkDeviceAttachment(fileHandle:)`
-  ```
+Defaults are unchanged: a single shared interface with the legacy stream
+protocol. Every new behavior is opt-in.
 
-  The fast path is then a pure datagram copy between the per-VM fd and the
-  per-VM `vmnet` interface, vectorizable with `recvmmsg`/`sendmmsg`.
+## Validation
 
-### Caveats to validate on real hardware
+Not yet run. The plan, reproducing [#58][issue-58]'s benchmark:
 
-- **Scaling.** N interfaces means N software bridges and N DHCP leases.
-  `vmnet` has limits on the number of interfaces; measure the ceiling and the
-  per-interface overhead, and cap with a fallback to the shared-interface
-  Phase 1 mode.
-- **`isolated=on` conflict.** Mixing isolated and non-isolated interfaces on the
-  same sharing service has been observed to fail with *"conflict, sharing
-  service is in use"* (see [utmapp/UTM#4520][utm-4520]). Treat isolation as a
-  per-network choice for the whole daemon, not an arbitrary per-VM mix, and
-  verify empirically.
-- **Version / signing requirements.** The isolation key requires macOS 11+;
-  `-netdev dgram` requires QEMU 7.2+; and `vmnet` itself is gated behind SIP and
-  requires the binary to be code-signed with a full Apple Developer certificate.
-
-## Compatibility & rollout
-
-- Phase 1 keeps the wire protocol and the single-interface model; the only
-  behavioral change is that unicast is no longer flooded. `--isolated` is
-  opt-in.
-- Phase 0 adds a new endpoint; the stream protocol stays the default.
-- Phase 2 is selectable (e.g. `--interface-per-vm`) and falls back to Phase 1.
+1. Build and code-sign per `README.md`; run as root.
+2. 1→4 guests, `iperf3` from one guest to an external host; record throughput
+   and the daemon's CPU. Compare: stock flooding vs Phase 1 (shared switched)
+   vs Phase 2 (`--interface-per-vm`). Expect the multi-VM throughput collapse to
+   flatten, and the "unrelated packet" CPU to drop toward zero.
+3. Correctness matrix per mode: ARP/broadcast reaches all guests; unicast
+   reaches only the addressed guest; `--isolated` blocks guest-to-guest while
+   leaving gateway/NAT/external reachable.
+4. Transport matrix: QEMU `-netdev socket` (stream) and `-netdev dgram`
+   (datagram); a VZ `VZFileHandleNetworkDeviceAttachment` launcher on the
+   datagram socket.
 
 [issue-77]: https://github.com/lima-vm/socket_vmnet/issues/77
 [issue-58]: https://github.com/lima-vm/socket_vmnet/issues/58

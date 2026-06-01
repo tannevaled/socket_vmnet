@@ -28,9 +28,18 @@ struct cli_options {
   // -p, --pidfile; writes pidfile using permissions of socket_vmnet
   char *pidfile;
   // --isolated; drop guest-to-guest traffic (guests can still reach the
-  // gateway/NAT, but they cannot see each other)
+  // gateway/NAT, but they cannot see each other). In --interface-per-vm mode
+  // this is enforced by vmnet's own isolation key (hard, non-spoofable).
   bool isolated;
-  // arg
+  // --interface-per-vm (Phase 2); start a dedicated vmnet interface per client
+  // so that vmnet.framework performs the L2 switching itself
+  bool interface_per_vm;
+  // --socket-dgram=PATH (Phase 0); additional header-less SOCK_DGRAM endpoint,
+  // consumed by QEMU `-netdev dgram` and Apple's
+  // VZFileHandleNetworkDeviceAttachment. The positional stream socket keeps the
+  // legacy uint32be-length-prefixed protocol.
+  char *socket_dgram_path;
+  // arg (the positional SOCK_STREAM socket; legacy QEMU `-netdev socket`)
   char *socket_path;
 };
 
