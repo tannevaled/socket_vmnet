@@ -64,6 +64,10 @@ static void print_usage(const char *argv0) {
          "start with fd00::/8.\n");
   printf("                                    (default: random)\n");
   printf("-p, --pidfile=PIDFILE               save pid to PIDFILE\n");
+  printf("--isolated                          drop guest-to-guest traffic; "
+         "guests can still reach the\n");
+  printf("                                    gateway/NAT but cannot see each "
+         "other\n");
   printf("-h, --help                          display this help and exit\n");
   printf("-v, --version                       display version information and "
          "exit\n");
@@ -83,6 +87,7 @@ enum {
   CLI_OPT_VMNET_INTERFACE_ID,
   CLI_OPT_VMNET_NAT66_PREFIX,
   CLI_OPT_VMNET_NETWORK_IDENTIFIER,
+  CLI_OPT_ISOLATED,
 };
 
 struct cli_options *cli_options_parse(int argc, char *argv[]) {
@@ -102,6 +107,7 @@ struct cli_options *cli_options_parse(int argc, char *argv[]) {
       {"vmnet-interface-id",       required_argument, NULL, CLI_OPT_VMNET_INTERFACE_ID      },
       {"vmnet-nat66-prefix",       required_argument, NULL, CLI_OPT_VMNET_NAT66_PREFIX      },
       {"vmnet-network-identifier", required_argument, NULL, CLI_OPT_VMNET_NETWORK_IDENTIFIER},
+      {"isolated",                 no_argument,       NULL, CLI_OPT_ISOLATED                },
       {"pidfile",                  required_argument, NULL, 'p'                             },
       {"help",                     no_argument,       NULL, 'h'                             },
       {"version",                  no_argument,       NULL, 'v'                             },
@@ -151,6 +157,9 @@ struct cli_options *cli_options_parse(int argc, char *argv[]) {
         ERRORF("Failed to parse network identifier UUID \"%s\"", optarg);
         goto error;
       }
+      break;
+    case CLI_OPT_ISOLATED:
+      res->isolated = true;
       break;
     case 'p':
       res->pidfile = strdup(optarg);

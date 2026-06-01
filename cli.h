@@ -1,6 +1,7 @@
 #ifndef SOCKET_VMNET_CLI_H
 #define SOCKET_VMNET_CLI_H
 
+#include <stdbool.h>
 #include <uuid/uuid.h>
 
 #include <vmnet/vmnet.h>
@@ -26,6 +27,9 @@ struct cli_options {
   char *vmnet_nat66_prefix;
   // -p, --pidfile; writes pidfile using permissions of socket_vmnet
   char *pidfile;
+  // --isolated; drop guest-to-guest traffic (guests can still reach the
+  // gateway/NAT, but they cannot see each other)
+  bool isolated;
   // arg
   char *socket_path;
 };

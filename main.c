@@ -73,7 +73,10 @@ static void print_vmnet_start_param(xpc_object_t param) {
 }
 
 struct conn {
-  // TODO: uint8_t mac[6];
+  // Source MAC learned from the guest's egress frames. Used to switch unicast
+  // traffic to a single client instead of flooding every connection.
+  uint8_t mac[6];
+  bool mac_known;
   int socket_fd;
   struct conn *next;
 } _conn;
@@ -83,7 +86,58 @@ struct state {
   dispatch_queue_t vms_queue;
   dispatch_queue_t host_queue;
   struct conn *conns; // TODO: avoid O(N) lookup
+  // When true, guest-to-guest frames are never forwarded directly between
+  // clients. Guests can still reach the gateway/NAT (and the outside world),
+  // but they cannot see each other. Set via --isolated.
+  bool isolated;
 } _state;
+
+// A MAC is multicast (which includes broadcast ff:ff:ff:ff:ff:ff) when the
+// least-significant bit of the first octet is set. Such frames must be flooded.
+static inline bool mac_is_multicast(const uint8_t mac[6]) { return (mac[0] & 0x01) != 0; }
+
+// Find the connection that previously advertised src_mac as its own.
+// The caller must hold state->sem.
+static struct conn *conn_find_by_mac(struct state *state, const uint8_t mac[6]) {
+  for (struct conn *c = state->conns; c != NULL; c = c->next) {
+    if (c->mac_known && memcmp(c->mac, mac, sizeof(c->mac)) == 0)
+      return c;
+  }
+  return NULL;
+}
+
+// Associate src_mac with the connection owning socket_fd (MAC learning).
+// Multicast/broadcast addresses are never valid as a source and are ignored.
+// The caller must hold state->sem.
+static void conn_learn_mac(struct state *state, int socket_fd, const uint8_t src_mac[6]) {
+  if (mac_is_multicast(src_mac))
+    return;
+  for (struct conn *c = state->conns; c != NULL; c = c->next) {
+    if (c->socket_fd == socket_fd) {
+      if (!c->mac_known || memcmp(c->mac, src_mac, sizeof(c->mac)) != 0) {
+        memcpy(c->mac, src_mac, sizeof(c->mac));
+        c->mac_known = true;
+        DEBUGF("Learned MAC %02X:%02X:%02X:%02X:%02X:%02X on socket %d", src_mac[0], src_mac[1],
+               src_mac[2], src_mac[3], src_mac[4], src_mac[5], socket_fd);
+      }
+      return;
+    }
+  }
+}
+
+// Send a single ethernet frame to a client, prefixed with the uint32be length
+// header expected by the QEMU stream protocol.
+static void send_frame(int socket_fd, const void *body, uint32_t len) {
+  uint32_t header_be = htonl(len);
+  struct iovec iov[2] = {
+      {.iov_base = &header_be,   .iov_len = 4  },
+      {.iov_base = (void *)body, .iov_len = len},
+  };
+  ssize_t written = writev(socket_fd, iov, 2);
+  if (written < 0) {
+    ERRORN("writev");
+  }
+}
 
 static void state_add_socket_fd(struct state *state, int socket_fd) {
   struct conn *conn = calloc(1, sizeof(*conn));
@@ -163,35 +217,38 @@ static void _on_vmnet_packets_available(interface_ref iface, int64_t buf_count, 
            "%02X:%02X:%02X:%02X:%02X:%02X,",
            i, dest_mac[0], dest_mac[1], dest_mac[2], dest_mac[3], dest_mac[4], dest_mac[5],
            src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5]);
+    void *body = pdv[i].vm_pkt_iov[0].iov_base;
+    uint32_t body_len = (uint32_t)pdv[i].vm_pkt_size; // not vm_pkt_iov[0].iov_len
+
+    // Switched forwarding: deliver unicast frames only to the client that owns
+    // the destination MAC. Multicast/broadcast and not-yet-learned unicast are
+    // flooded, exactly like a learning ethernet switch. This replaces the
+    // previous unconditional flood (one copy per connection).
+    //
+    // This path carries traffic coming from vmnet (NAT/external/other hosts on
+    // a bridged segment), so it is delivered regardless of --isolated; isolation
+    // only governs direct guest-to-guest forwarding (see on_accept).
     dispatch_semaphore_wait(state->sem, DISPATCH_TIME_FOREVER);
-    struct conn *conns = state->conns;
-    dispatch_semaphore_signal(state->sem);
-    for (struct conn *conn = conns; conn != NULL; conn = conn->next) {
-      // FIXME: avoid flooding
-      DEBUGF("[Handler i=%d] Sending to the socket %d: 4 + %ld bytes [Dest "
-             "%02X:%02X:%02X:%02X:%02X:%02X]",
-             i, conn->socket_fd, pdv[i].vm_pkt_size, dest_mac[0], dest_mac[1], dest_mac[2],
-             dest_mac[3], dest_mac[4], dest_mac[5]);
-      uint32_t header_be = htonl(pdv[i].vm_pkt_size);
-      struct iovec iov[2] = {
-          {
-           .iov_base = &header_be,
-           .iov_len = 4,
-           },
-          {
-           .iov_base = pdv[i].vm_pkt_iov[0].iov_base,
-           .iov_len = pdv[i].vm_pkt_size, // not vm_pkt_iov[0].iov_len
-          },
-      };
-      ssize_t written = writev(conn->socket_fd, iov, 2);
-      DEBUGF("[Handler i=%d] Sent to the socket: %ld bytes (including uint32be "
-             "header)",
-             i, written);
-      if (written < 0) {
-        ERRORN("writev");
-        goto done;
-      }
+    struct conn *target = NULL;
+    bool flood = mac_is_multicast(dest_mac);
+    if (!flood) {
+      target = conn_find_by_mac(state, dest_mac);
+      if (target == NULL)
+        flood = true; // unknown unicast: flood until the MAC is learned
     }
+    if (flood) {
+      for (struct conn *conn = state->conns; conn != NULL; conn = conn->next) {
+        DEBUGF("[Handler i=%d] Flooding to socket %d: 4 + %u bytes", i, conn->socket_fd, body_len);
+        send_frame(conn->socket_fd, body, body_len);
+      }
+    } else {
+      DEBUGF("[Handler i=%d] Switching to socket %d: 4 + %u bytes [Dest "
+             "%02X:%02X:%02X:%02X:%02X:%02X]",
+             i, target->socket_fd, body_len, dest_mac[0], dest_mac[1], dest_mac[2], dest_mac[3],
+             dest_mac[4], dest_mac[5]);
+      send_frame(target->socket_fd, body, body_len);
+    }
+    dispatch_semaphore_signal(state->sem);
   }
 done:
   if (pdv != NULL) {
@@ -469,6 +526,11 @@ int main(int argc, char *argv[]) {
     goto done;
   }
 
+  state.isolated = cliopt->isolated;
+  if (state.isolated) {
+    INFOF("%s", "Guest-to-guest isolation is enabled (--isolated)");
+  }
+
   state.sem = dispatch_semaphore_create(1);
 
   // Queue for vm connections, allowing processing vms requests in parallel.
@@ -575,6 +637,19 @@ static void on_accept(struct state *state, int accept_fd, interface_ref iface) {
     assert(received == header);
     DEBUGF("[Socket-to-VMNET i=%lld] Received from the socket %d: %ld bytes", i, accept_fd,
            received);
+
+    // Learn the guest's source MAC so that return traffic can be switched back
+    // to this connection instead of flooded to every client.
+    uint8_t dest_mac[6] = {0}, src_mac[6] = {0};
+    bool eth_parsed = header >= 12;
+    if (eth_parsed) {
+      memcpy(dest_mac, buf, sizeof(dest_mac));
+      memcpy(src_mac, (const uint8_t *)buf + 6, sizeof(src_mac));
+      dispatch_semaphore_wait(state->sem, DISPATCH_TIME_FOREVER);
+      conn_learn_mac(state, accept_fd, src_mac);
+      dispatch_semaphore_signal(state->sem);
+    }
+
     struct iovec iov = {
         .iov_base = buf,
         .iov_len = header,
@@ -594,36 +669,36 @@ static void on_accept(struct state *state, int accept_fd, interface_ref iface) {
     }
     DEBUGF("[Socket-to-VMNET i=%lld] Sent to VMNET: %ld bytes", i, pd.vm_pkt_size);
 
-    // Flood the packet to other VMs in the same network too.
-    // (Not handled by vmnet)
-    // FIXME: avoid flooding
-    dispatch_semaphore_wait(state->sem, DISPATCH_TIME_FOREVER);
-    struct conn *conns = state->conns;
-    dispatch_semaphore_signal(state->sem);
-    for (struct conn *conn = conns; conn != NULL; conn = conn->next) {
-      if (conn->socket_fd == accept_fd)
-        continue;
-      DEBUGF("[Socket-to-Socket i=%lld] Sending from socket %d to socket %d: "
-             "4 + %d bytes",
-             i, accept_fd, conn->socket_fd, header);
-      struct iovec iov[2] = {
-          {
-           .iov_base = &header_be,
-           .iov_len = 4,
-           },
-          {
-           .iov_base = buf,
-           .iov_len = header,
-           },
-      };
-      ssize_t written = writev(conn->socket_fd, iov, 2);
-      DEBUGF("[Socket-to-Socket i=%lld] Sent from socket %d to socket %d: %ld "
-             "bytes (including uint32be header)",
-             i, accept_fd, conn->socket_fd, written);
-      if (written < 0) {
-        ERRORN("writev");
-        continue;
+    // Deliver guest-to-guest traffic between clients on the same network.
+    // (vmnet does not loop these frames back to us.) Previously every frame was
+    // flooded to every other connection; now we switch unicast frames to the
+    // single owning client and only flood multicast/broadcast and unknown
+    // unicast. With --isolated, guest-to-guest delivery is disabled entirely:
+    // guests keep reaching the gateway/NAT (handled above by vmnet_write) but
+    // cannot see each other.
+    if (!state->isolated && eth_parsed) {
+      dispatch_semaphore_wait(state->sem, DISPATCH_TIME_FOREVER);
+      struct conn *target = NULL;
+      bool flood = mac_is_multicast(dest_mac);
+      if (!flood) {
+        target = conn_find_by_mac(state, dest_mac);
+        if (target == NULL)
+          flood = true; // unknown unicast: flood until the MAC is learned
       }
+      if (flood) {
+        for (struct conn *conn = state->conns; conn != NULL; conn = conn->next) {
+          if (conn->socket_fd == accept_fd)
+            continue;
+          DEBUGF("[Socket-to-Socket i=%lld] Flooding from socket %d to socket %d: 4 + %d bytes", i,
+                 accept_fd, conn->socket_fd, header);
+          send_frame(conn->socket_fd, buf, header);
+        }
+      } else if (target->socket_fd != accept_fd) {
+        DEBUGF("[Socket-to-Socket i=%lld] Switching from socket %d to socket %d: 4 + %d bytes", i,
+               accept_fd, target->socket_fd, header);
+        send_frame(target->socket_fd, buf, header);
+      }
+      dispatch_semaphore_signal(state->sem);
     }
   }
 done:
