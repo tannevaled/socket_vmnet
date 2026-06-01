@@ -8,9 +8,10 @@ firewall state — at odds with the rootless-client model). The daemon already
 runs as root for `vmnet`, so the ACL adds no privilege and is scoped to its own
 traffic.
 
-This first version is **stateless**: there is no connection tracking, so an
-allow rule does **not** implicitly permit the return traffic. Stateful security
-groups (conntrack) are a planned follow-up.
+Filtering is **stateless by default** (each frame judged on its own); pass
+`--stateful` to additionally track TCP/UDP flows so the return traffic of an
+allowed flow is permitted automatically (see [Stateful mode](#stateful-mode---stateful)).
+Both IPv4 and IPv6 are matched.
 
 ## Authoring: HCL → JSON
 
@@ -80,8 +81,8 @@ rule { # global, no group binding
 | `action` | `allow` \| `deny` | required |
 | `direction` | `egress` \| `ingress` \| `any` (default) | egress = guest→; ingress = →guest |
 | `src_mac`, `dst_mac` | `aa:bb:cc:dd:ee:ff` | optional ethernet match |
-| `src_cidr`, `dst_cidr` | `a.b.c.d/n` | optional IPv4 match |
-| `proto` | `tcp` \| `udp` \| `icmp` \| `any` (default) | |
+| `src_cidr`, `dst_cidr` | `a.b.c.d/n` or `2001:db8::/32` | IPv4 or IPv6; only matches frames of the same family |
+| `proto` | `tcp` \| `udp` \| `icmp` \| `icmpv6` \| `any` (default) | |
 | `src_port`, `dst_port` | `N` or `[min, max]` | only for tcp/udp |
 
 Rules are evaluated **first-match-wins**; the first rule whose every present
@@ -97,12 +98,37 @@ field matches decides the verdict. If none match, `default_action` applies.
 If `--acl` is given and the file fails to parse, the daemon **refuses to start**
 (fail-closed) rather than running unfiltered.
 
-## Limitations (v1)
+## Stateful mode (`--stateful`)
 
-- **Stateless.** No conntrack; allow egress does not auto-allow the reply. Write
-  explicit ingress rules, or use `default_action = "allow"` with targeted denies.
-- **IPv4 only.** Non-IPv4 frames (ARP, IPv6) are always allowed so basic
-  networking keeps working; IPv6 filtering is a follow-up.
+By default the ACL is stateless: an `allow` on egress does **not** implicitly
+permit the reply. With `--stateful`, the daemon tracks TCP/UDP flows by
+normalized 5-tuple, so once a flow is allowed in one direction its return
+traffic is permitted automatically (idle timeouts: TCP 120 s, UDP 30 s):
+
+```bash
+socket_vmnet --acl=policy.acl.json --stateful /var/run/socket_vmnet
+```
+
+This lets you write a default-deny egress policy without having to enumerate
+ephemeral-port ingress rules for the replies. Connection state survives a SIGHUP
+reload. ICMP is not tracked.
+
+## Live reload (SIGHUP)
+
+Send `SIGHUP` to reload the ACL file in place without dropping connections:
+
+```bash
+kill -HUP "$(cat /var/run/socket_vmnet.pid)"
+```
+
+If the new file fails to parse, the previous ruleset (and connection state) is
+kept and an error is logged.
+
+## Limitations
+
 - **No fragments / no L4 options.** Ports are read from the first L4 header; IP
   fragments after the first are treated as having no ports.
-- **Reload requires restart.** No live reload yet (SIGHUP is a follow-up).
+- **IPv6 extension headers.** For IPv6 only the fixed 40-byte header is parsed;
+  if the next header is an extension header, transport ports are not matched.
+- **`icmp` vs `icmpv6`.** `proto = "icmp"` matches IPv4 ICMP (1); use
+  `proto = "icmpv6"` (58) for IPv6.

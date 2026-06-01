@@ -13,12 +13,14 @@
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 #include <uuid/uuid.h>
 #include <vmnet/vmnet.h>
 
 #include "acl.h"
 #include "cli.h"
+#include "conntrack.h"
 #include "log.h"
 
 #if __MAC_OS_X_VERSION_MAX_ALLOWED < 101500
@@ -120,7 +122,29 @@ struct state {
   struct cli_options *cliopt;
   // Optional stateless L3/L4 access-control list (--acl). NULL = allow all.
   struct acl *acl;
+  // Optional connection tracker (--stateful). NULL = stateless.
+  struct conntrack *ct;
 } _state;
+
+// Decide whether a frame is permitted by the ACL, consulting the connection
+// tracker first so that return traffic of an allowed flow passes. Safe to call
+// with no ACL (returns true). Takes state->sem (guards acl swap + conntrack).
+static bool frame_allowed(struct state *state, enum acl_dir dir, const void *buf, uint32_t len) {
+  if (state->acl == NULL)
+    return true;
+  uint64_t now = (uint64_t)time(NULL);
+  bool allow;
+  dispatch_semaphore_wait(state->sem, DISPATCH_TIME_FOREVER);
+  if (state->ct != NULL && conntrack_established(state->ct, buf, len, now)) {
+    allow = true;
+  } else {
+    allow = acl_allows(state->acl, dir, buf, len);
+    if (allow && state->ct != NULL)
+      conntrack_record(state->ct, buf, len, now);
+  }
+  dispatch_semaphore_signal(state->sem);
+  return allow;
+}
 
 // A MAC is multicast (which includes broadcast ff:ff:ff:ff:ff:ff) when the
 // least-significant bit of the first octet is set. Such frames must be flooded.
@@ -270,7 +294,7 @@ static void _on_vmnet_packets_available(interface_ref iface, int64_t buf_count, 
     uint32_t body_len = (uint32_t)pdv[i].vm_pkt_size; // not vm_pkt_iov[0].iov_len
 
     // Phase 3: drop ingress frames denied by the ACL before delivering them.
-    if (!acl_allows(state->acl, ACL_INGRESS, body, body_len)) {
+    if (!frame_allowed(state, ACL_INGRESS, body, body_len)) {
       DEBUGF("[Handler i=%d] Dropped by ACL (ingress)", i);
       continue;
     }
@@ -681,7 +705,7 @@ static void on_dgram_readable(struct state *state, int dgram_fd, interface_ref s
       }
     }
 
-    if (!acl_allows(state->acl, ACL_EGRESS, buf, len)) {
+    if (!frame_allowed(state, ACL_EGRESS, buf, len)) {
       DEBUGF("%s", "Datagram dropped by ACL (egress)");
       continue;
     }
@@ -775,6 +799,17 @@ int main(int argc, char *argv[]) {
       // unfiltered when an ACL was explicitly requested.
       goto done;
     }
+    if (cliopt->stateful) {
+      // 4096 flows; TCP 120s, UDP 30s idle timeouts.
+      state.ct = conntrack_new(4096, 120, 30);
+      if (state.ct == NULL) {
+        ERRORN("conntrack_new");
+        goto done;
+      }
+      INFOF("%s", "Stateful filtering enabled (--stateful)");
+    }
+  } else if (cliopt->stateful) {
+    WARN("--stateful has no effect without --acl");
   }
 
   state.sem = dispatch_semaphore_create(1);
@@ -813,6 +848,22 @@ int main(int argc, char *argv[]) {
     }
 
     if (events[0].filter == EVFILT_SIGNAL) {
+      if ((int)events[0].ident == SIGHUP && cliopt->acl_path != NULL) {
+        // Hot-reload the ACL; keep the old ruleset (and connection state) if the
+        // new file fails to parse.
+        INFOF("%s", "Received SIGHUP, reloading ACL");
+        struct acl *fresh = acl_load(cliopt->acl_path);
+        if (fresh != NULL) {
+          dispatch_semaphore_wait(state.sem, DISPATCH_TIME_FOREVER);
+          struct acl *old = state.acl;
+          state.acl = fresh;
+          dispatch_semaphore_signal(state.sem);
+          acl_destroy(old);
+        } else {
+          ERROR("acl: reload failed; keeping the previous ruleset");
+        }
+        continue;
+      }
       INFOF("Received signal %s", strsignal(events[0].ident));
       break;
     }
@@ -852,6 +903,7 @@ done:
   }
   free(dgram_buf);
   acl_destroy(state.acl);
+  conntrack_free(state.ct);
   if (pidfile_fd != -1) {
     remove_pidfile(cliopt->pidfile);
     close(pidfile_fd);
@@ -930,7 +982,7 @@ static void on_accept(struct state *state, struct conn *conn, interface_ref shar
 
     // Phase 3: drop egress frames denied by the ACL (no vmnet write, no
     // guest-to-guest forwarding).
-    if (!acl_allows(state->acl, ACL_EGRESS, buf, header)) {
+    if (!frame_allowed(state, ACL_EGRESS, buf, header)) {
       DEBUGF("[Socket-to-VMNET i=%lld] Dropped by ACL (egress)", i);
       continue;
     }

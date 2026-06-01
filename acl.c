@@ -1,3 +1,4 @@
+#include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
@@ -355,6 +356,16 @@ static const jnode *jget(const jnode *obj, const char *key) {
 enum acl_action { ACL_DENY = 0, ACL_ALLOW = 1 };
 enum rule_dir { RDIR_ANY = 0, RDIR_EGRESS, RDIR_INGRESS };
 
+/* An IPv4 or IPv6 network prefix, normalized to 16-byte network-order buffers
+ * (IPv4 uses the first 4 bytes). family is 4 or 6; len is 4 or 16. */
+struct cidr {
+  bool set;
+  int family;
+  int len;
+  uint8_t net[16];
+  uint8_t mask[16];
+};
+
 struct rule {
   enum acl_action action;
   enum rule_dir dir;
@@ -362,9 +373,7 @@ struct rule {
   bool has_src_mac, has_dst_mac;
   uint8_t src_mac[6], dst_mac[6];
 
-  bool has_src_cidr, has_dst_cidr;
-  uint32_t src_net, src_mask; /* host byte order */
-  uint32_t dst_net, dst_mask;
+  struct cidr src_cidr, dst_cidr;
 
   int proto; /* -1 = any, else IP protocol number */
 
@@ -391,16 +400,56 @@ static bool parse_mac(const char *s, uint8_t out[6]) {
   return true;
 }
 
-static bool parse_cidr(const char *s, uint32_t *net, uint32_t *mask) {
-  unsigned a, b, c, d, bits;
-  if (sscanf(s, "%u.%u.%u.%u/%u", &a, &b, &c, &d, &bits) != 5)
+/* Parse "addr/bits" for IPv4 or IPv6 into a normalized struct cidr. */
+static bool parse_cidr(const char *s, struct cidr *out) {
+  const char *slash = strchr(s, '/');
+  if (slash == NULL)
     return false;
-  if (a > 255 || b > 255 || c > 255 || d > 255 || bits > 32)
+  size_t alen = (size_t)(slash - s);
+  char addr[64];
+  if (alen == 0 || alen >= sizeof(addr))
     return false;
-  uint32_t ip = (a << 24) | (b << 16) | (c << 8) | d;
-  uint32_t m = bits == 0 ? 0 : (0xFFFFFFFFu << (32 - bits));
-  *net = ip & m;
-  *mask = m;
+  memcpy(addr, s, alen);
+  addr[alen] = '\0';
+
+  char *endp = NULL;
+  long bits = strtol(slash + 1, &endp, 10);
+  if (endp == slash + 1 || *endp != '\0' || bits < 0)
+    return false;
+
+  uint8_t a[16] = {0};
+  if (strchr(addr, ':') != NULL) {
+    if (bits > 128 || inet_pton(AF_INET6, addr, a) != 1)
+      return false;
+    out->family = 6;
+    out->len = 16;
+  } else {
+    if (bits > 32 || inet_pton(AF_INET, addr, a) != 1)
+      return false;
+    out->family = 4;
+    out->len = 4;
+  }
+  /* Build the mask from the prefix length, then normalize the network. */
+  memset(out->mask, 0, sizeof(out->mask));
+  for (int i = 0; i < out->len; i++) {
+    int take = (int)bits - i * 8;
+    if (take >= 8)
+      out->mask[i] = 0xFF;
+    else if (take > 0)
+      out->mask[i] = (uint8_t)(0xFF << (8 - take));
+    out->net[i] = a[i] & out->mask[i];
+  }
+  out->set = true;
+  return true;
+}
+
+static bool cidr_match(const struct cidr *c, int fam, const uint8_t *addr) {
+  if (c->family != fam)
+    return false;
+  for (int i = 0; i < c->len; i++) {
+    if ((addr[i] & c->mask[i]) != c->net[i])
+      return false;
+  }
   return true;
 }
 
@@ -413,6 +462,8 @@ static int proto_number(const char *s) {
     return 6;
   if (strcmp(s, "udp") == 0)
     return 17;
+  if (strcmp(s, "icmpv6") == 0)
+    return 58;
   return -2; /* invalid */
 }
 
@@ -488,19 +539,17 @@ static bool parse_rule(const jnode *r, struct rule *out) {
 
   const jnode *sc = jget(r, "src_cidr");
   if (sc != NULL && sc->type == J_STR) {
-    if (!parse_cidr(sc->str, &out->src_net, &out->src_mask)) {
+    if (!parse_cidr(sc->str, &out->src_cidr)) {
       ERRORF("acl: invalid src_cidr \"%s\"", sc->str);
       return false;
     }
-    out->has_src_cidr = true;
   }
   const jnode *dc = jget(r, "dst_cidr");
   if (dc != NULL && dc->type == J_STR) {
-    if (!parse_cidr(dc->str, &out->dst_net, &out->dst_mask)) {
+    if (!parse_cidr(dc->str, &out->dst_cidr)) {
       ERRORF("acl: invalid dst_cidr \"%s\"", dc->str);
       return false;
     }
-    out->has_dst_cidr = true;
   }
 
   const jnode *proto = jget(r, "proto");
@@ -615,35 +664,70 @@ void acl_destroy(struct acl *acl) {
 
 static bool port_in(int p, int min, int max) { return p >= min && p <= max; }
 
+/* The L3/L4 fields the matcher cares about, for either address family. */
+struct l3l4 {
+  int family; /* 4 or 6 */
+  uint8_t src[16], dst[16];
+  int proto;
+  int sport, dport; /* -1 if not applicable */
+};
+
+/* Classify an ethernet frame. Returns false for non-IP / runt / truncated
+ * frames (which the caller then allows unconditionally). For IPv6 only the
+ * fixed header is parsed; if the next header is an extension header, transport
+ * ports are left unset (-1). */
+static bool classify(const uint8_t *frame, size_t len, struct l3l4 *o) {
+  if (len < 14)
+    return false;
+  uint16_t ethertype = (uint16_t)((frame[12] << 8) | frame[13]);
+  const uint8_t *l3 = frame + 14;
+  size_t l3len = len - 14;
+  o->sport = o->dport = -1;
+  memset(o->src, 0, sizeof(o->src));
+  memset(o->dst, 0, sizeof(o->dst));
+
+  if (ethertype == 0x0800) { /* IPv4 */
+    if (l3len < 20)
+      return false;
+    size_t ihl = (size_t)(l3[0] & 0x0F) * 4;
+    if (ihl < 20 || l3len < ihl)
+      return false;
+    o->family = 4;
+    o->proto = l3[9];
+    memcpy(o->src, l3 + 12, 4);
+    memcpy(o->dst, l3 + 16, 4);
+    if ((o->proto == 6 || o->proto == 17) && l3len >= ihl + 4) {
+      const uint8_t *l4 = l3 + ihl;
+      o->sport = (l4[0] << 8) | l4[1];
+      o->dport = (l4[2] << 8) | l4[3];
+    }
+    return true;
+  }
+  if (ethertype == 0x86DD) { /* IPv6 */
+    if (l3len < 40)
+      return false;
+    o->family = 6;
+    o->proto = l3[6]; /* next header */
+    memcpy(o->src, l3 + 8, 16);
+    memcpy(o->dst, l3 + 24, 16);
+    if ((o->proto == 6 || o->proto == 17) && l3len >= 40 + 4) {
+      const uint8_t *l4 = l3 + 40;
+      o->sport = (l4[0] << 8) | l4[1];
+      o->dport = (l4[2] << 8) | l4[3];
+    }
+    return true;
+  }
+  return false; /* ARP, etc. */
+}
+
 bool acl_allows(const struct acl *acl, enum acl_dir dir, const uint8_t *frame, size_t len) {
   if (acl == NULL)
     return true;
 
-  /* Only IPv4 is classified in this first version; everything else (ARP, IPv6,
-   * runt frames) is allowed so that basic networking keeps working. */
-  if (len < 14)
+  /* Non-IP / runt / truncated frames are allowed so basic networking works. */
+  struct l3l4 p;
+  if (!classify(frame, len, &p))
     return true;
-  uint16_t ethertype = (uint16_t)((frame[12] << 8) | frame[13]);
-  if (ethertype != 0x0800)
-    return true;
-
-  const uint8_t *ip = frame + 14;
-  size_t iplen = len - 14;
-  if (iplen < 20)
-    return true;
-  size_t ihl = (size_t)(ip[0] & 0x0F) * 4;
-  if (ihl < 20 || iplen < ihl)
-    return true;
-  uint8_t protocol = ip[9];
-  uint32_t src = (uint32_t)((ip[12] << 24) | (ip[13] << 16) | (ip[14] << 8) | ip[15]);
-  uint32_t dst = (uint32_t)((ip[16] << 24) | (ip[17] << 16) | (ip[18] << 8) | ip[19]);
-
-  int sport = -1, dport = -1;
-  if ((protocol == 6 || protocol == 17) && iplen >= ihl + 4) {
-    const uint8_t *l4 = ip + ihl;
-    sport = (l4[0] << 8) | l4[1];
-    dport = (l4[2] << 8) | l4[3];
-  }
 
   enum rule_dir want = dir == ACL_EGRESS ? RDIR_EGRESS : RDIR_INGRESS;
   for (size_t i = 0; i < acl->n; i++) {
@@ -654,15 +738,15 @@ bool acl_allows(const struct acl *acl, enum acl_dir dir, const uint8_t *frame, s
       continue;
     if (r->has_dst_mac && memcmp(frame + 0, r->dst_mac, 6) != 0)
       continue;
-    if (r->has_src_cidr && (src & r->src_mask) != r->src_net)
+    if (r->src_cidr.set && !cidr_match(&r->src_cidr, p.family, p.src))
       continue;
-    if (r->has_dst_cidr && (dst & r->dst_mask) != r->dst_net)
+    if (r->dst_cidr.set && !cidr_match(&r->dst_cidr, p.family, p.dst))
       continue;
-    if (r->proto >= 0 && r->proto != protocol)
+    if (r->proto >= 0 && r->proto != p.proto)
       continue;
-    if (r->has_sport && (sport < 0 || !port_in(sport, r->sport_min, r->sport_max)))
+    if (r->has_sport && (p.sport < 0 || !port_in(p.sport, r->sport_min, r->sport_max)))
       continue;
-    if (r->has_dport && (dport < 0 || !port_in(dport, r->dport_min, r->dport_max)))
+    if (r->has_dport && (p.dport < 0 || !port_in(p.dport, r->dport_min, r->dport_max)))
       continue;
     return r->action == ACL_ALLOW;
   }

@@ -80,6 +80,10 @@ static void print_usage(const char *argv0) {
          "L3/L4 filtering\n");
   printf("                                    (see the hcl2acl helper) "
          "(Phase 3)\n");
+  printf("--stateful                          track TCP/UDP flows so return "
+         "traffic is allowed\n");
+  printf("                                    without an explicit reverse rule "
+         "(requires --acl)\n");
   printf("-h, --help                          display this help and exit\n");
   printf("-v, --version                       display version information and "
          "exit\n");
@@ -103,6 +107,7 @@ enum {
   CLI_OPT_INTERFACE_PER_VM,
   CLI_OPT_SOCKET_DGRAM,
   CLI_OPT_ACL,
+  CLI_OPT_STATEFUL,
 };
 
 struct cli_options *cli_options_parse(int argc, char *argv[]) {
@@ -126,6 +131,7 @@ struct cli_options *cli_options_parse(int argc, char *argv[]) {
       {"interface-per-vm",         no_argument,       NULL, CLI_OPT_INTERFACE_PER_VM        },
       {"socket-dgram",             required_argument, NULL, CLI_OPT_SOCKET_DGRAM            },
       {"acl",                      required_argument, NULL, CLI_OPT_ACL                     },
+      {"stateful",                 no_argument,       NULL, CLI_OPT_STATEFUL                },
       {"pidfile",                  required_argument, NULL, 'p'                             },
       {"help",                     no_argument,       NULL, 'h'                             },
       {"version",                  no_argument,       NULL, 'v'                             },
@@ -187,6 +193,9 @@ struct cli_options *cli_options_parse(int argc, char *argv[]) {
       break;
     case CLI_OPT_ACL:
       res->acl_path = strdup(optarg);
+      break;
+    case CLI_OPT_STATEFUL:
+      res->stateful = true;
       break;
     case 'p':
       res->pidfile = strdup(optarg);

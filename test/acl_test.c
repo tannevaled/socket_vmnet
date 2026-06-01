@@ -6,6 +6,7 @@
  * Exercises the JSON parser and the matcher; needs neither vmnet nor root.
  * Aims for full line coverage of acl.c (the defensive malloc-failure branches
  * cannot be hit without fault injection). */
+#include <arpa/inet.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -64,6 +65,29 @@ static size_t build_ip(uint8_t *buf, const uint8_t smac[6], const uint8_t dmac[6
   l4p[2] = (uint8_t)(dport >> 8);
   l4p[3] = (uint8_t)dport;
   return 14 + ihl + 4;
+}
+
+/* Build an ethernet + IPv6 + L4 frame. nh is the next-header (6/17/58/...). */
+static size_t build_ip6(uint8_t *buf, const uint8_t smac[6], const uint8_t dmac[6], uint8_t nh,
+                        const char *sip, const char *dip, uint16_t sport, uint16_t dport, bool l4) {
+  memcpy(buf, dmac, 6);
+  memcpy(buf + 6, smac, 6);
+  buf[12] = 0x86;
+  buf[13] = 0xDD;
+  uint8_t *ip6 = buf + 14;
+  memset(ip6, 0, 40);
+  ip6[0] = 0x60; /* version 6 */
+  ip6[6] = nh;
+  inet_pton(AF_INET6, sip, ip6 + 8);
+  inet_pton(AF_INET6, dip, ip6 + 24);
+  if (!l4)
+    return 14 + 40;
+  uint8_t *l4p = ip6 + 40;
+  l4p[0] = (uint8_t)(sport >> 8);
+  l4p[1] = (uint8_t)sport;
+  l4p[2] = (uint8_t)(dport >> 8);
+  l4p[3] = (uint8_t)dport;
+  return 14 + 40 + 4;
 }
 
 #define IP(a, b, c, d) (((uint32_t)(a) << 24) | ((b) << 16) | ((c) << 8) | (d))
@@ -287,6 +311,44 @@ int main(void) {
   check("number alloc failure", acl_parse("123", 3) == NULL, true);
   acl_alloc_budget = -1;
 #endif
+
+  /* ---- IPv6 ---- */
+
+  /* deny egress to 2001:db8::/32 tcp/443; family-scoped. */
+  {
+    struct acl *acl = load_json("{\"default_action\":\"allow\",\"rules\":["
+                                "{\"action\":\"deny\",\"direction\":\"egress\","
+                                "\"dst_cidr\":\"2001:db8::/32\",\"proto\":\"tcp\","
+                                "\"dst_port\":443}]}");
+    n = build_ip6(f, MAC_A, MAC_B, 6, "2001:db8::2", "2001:db8::1", 5000, 443, true);
+    check("v6 in-prefix tcp/443 denied", acl_allows(acl, ACL_EGRESS, f, n), false);
+    n = build_ip6(f, MAC_A, MAC_B, 6, "2001:db8::2", "2001:dead::1", 5000, 443, true);
+    check("v6 out-of-prefix allowed", acl_allows(acl, ACL_EGRESS, f, n), true);
+    /* v4 frame must not match a v6 rule (family mismatch -> rule skipped). */
+    n = TCP(f, MAC_A, MAC_B, IP(1, 1, 1, 1), IP(2, 2, 2, 2), 5000, 443);
+    check("v4 frame skips v6 rule", acl_allows(acl, ACL_EGRESS, f, n), true);
+    acl_destroy(acl);
+  }
+
+  /* v6 cidr rule does not match a v4 frame and vice versa. */
+  {
+    struct acl *acl = load_json("{\"default_action\":\"allow\",\"rules\":["
+                                "{\"action\":\"deny\",\"src_cidr\":\"10.0.0.0/8\"}]}");
+    n = build_ip6(f, MAC_A, MAC_B, 6, "10::1", "20::1", 1, 2, true);
+    check("v6 frame skips v4 rule", acl_allows(acl, ACL_EGRESS, f, n), true);
+    acl_destroy(acl);
+  }
+
+  /* icmpv6 proto + truncated v6 frame. */
+  {
+    struct acl *acl = load_json("{\"default_action\":\"deny\",\"rules\":["
+                                "{\"action\":\"allow\",\"proto\":\"icmpv6\"}]}");
+    n = build_ip6(f, MAC_A, MAC_B, 58, "fe80::1", "fe80::2", 0, 0, false);
+    check("icmpv6 allowed", acl_allows(acl, ACL_EGRESS, f, n), true);
+    /* truncated v6 (no full 40-byte header) -> allowed regardless of default. */
+    check("short v6 allowed", acl_allows(acl, ACL_EGRESS, f, 14 + 20), true);
+    acl_destroy(acl);
+  }
 
   /* NULL acl always allows. */
   check("NULL acl allows", acl_allows(NULL, ACL_EGRESS, f, 14), true);

@@ -130,22 +130,28 @@ clean:
 # Unit tests for the dependency-free, vmnet-independent modules (run anywhere,
 # no root, no code signing). The vmnet datapath itself is validated separately
 # on real hardware (see DESIGN.md).
-TEST_CFLAGS ?= -I. -O0 -g -Wall -Wextra -DACL_FAULT_INJECT -fsanitize=address
+TEST_CFLAGS ?= -I. -O0 -g -Wall -Wextra -DACL_FAULT_INJECT -DCT_FAULT_INJECT -fsanitize=address
 
 .PHONY: test
 test:
 	$(CC) $(TEST_CFLAGS) acl.c test/acl_test.c -o test/acl_test
 	./test/acl_test
+	$(CC) $(TEST_CFLAGS) conntrack.c test/conntrack_test.c -o test/conntrack_test
+	./test/conntrack_test
 
 # Coverage report for the unit-tested modules via llvm-cov.
+COVER_CFLAGS = $(TEST_CFLAGS) -fprofile-instr-generate -fcoverage-mapping
 .PHONY: cover
 cover:
 	rm -f *.profraw *.profdata
-	$(CC) $(TEST_CFLAGS) -fprofile-instr-generate -fcoverage-mapping \
-		acl.c test/acl_test.c -o test/acl_test
+	$(CC) $(COVER_CFLAGS) acl.c test/acl_test.c -o test/acl_test
 	LLVM_PROFILE_FILE=acl.profraw ./test/acl_test >/dev/null
-	xcrun llvm-profdata merge -sparse acl.profraw -o cover.profdata
-	xcrun llvm-cov report ./test/acl_test -instr-profile=cover.profdata acl.c
+	$(CC) $(COVER_CFLAGS) conntrack.c test/conntrack_test.c -o test/conntrack_test
+	LLVM_PROFILE_FILE=conntrack.profraw ./test/conntrack_test >/dev/null
+	xcrun llvm-profdata merge -sparse acl.profraw -o acl.profdata
+	xcrun llvm-profdata merge -sparse conntrack.profraw -o conntrack.profdata
+	xcrun llvm-cov report ./test/acl_test -instr-profile=acl.profdata acl.c
+	xcrun llvm-cov report ./test/conntrack_test -instr-profile=conntrack.profdata conntrack.c
 
 define make_artifacts
 	$(MAKE) clean

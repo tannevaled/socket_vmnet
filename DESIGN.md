@@ -136,10 +136,23 @@ Why here and not `pf`: `pfctl` needs root **and** mutates global host firewall
 state, against the rootless-client model; the daemon already runs as root and
 the ACL is scoped to its own traffic. Why stateless first: conntrack is the bulk
 of the cost/complexity; a stateless allow/deny already covers targeted policies.
-Unlike the vmnet paths, `acl.c` is unit-tested offline (`test/acl_test.c`).
+Unlike the vmnet paths, `acl.c` and `conntrack.c` are unit-tested offline
+(`test/acl_test.c`, `test/conntrack_test.c`) — including allocation
+fault-injection — and measured with `make cover` (acl.c ~98% line / 100% func,
+conntrack.c ~99% line / 100% func; residuals are defensive I/O / dead branches).
 
-Follow-ups: stateful conntrack (return-traffic), IPv6, per-group live reload
-(SIGHUP).
+Now implemented on top of the stateless base:
+
+- **Stateful (`--stateful`)** — `conntrack.c` tracks TCP/UDP flows by normalized
+  5-tuple; `frame_allowed()` consults it before the rules so return traffic of an
+  allowed flow passes (TCP 120 s / UDP 30 s idle timeouts). ICMP not tracked.
+- **IPv6** — the matcher classifies both IPv4 (0x0800) and IPv6 (0x86DD);
+  `src_cidr`/`dst_cidr` accept v6 prefixes and only match same-family frames;
+  `proto = "icmpv6"` added.
+- **SIGHUP reload** — the daemon hot-reloads `--acl` in place, keeping the old
+  ruleset and connection state if the new file fails to parse.
+
+Follow-ups: stateful ICMP, IPv6 extension-header walking, configurable timeouts.
 
 ## How the pieces compose
 

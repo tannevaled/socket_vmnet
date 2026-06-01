@@ -42,6 +42,9 @@ struct cli_options {
   // --acl=PATH (Phase 3); JSON access-control list (see hcl2acl) applied to
   // guest egress and ingress for targeted L3/L4 filtering.
   char *acl_path;
+  // --stateful; track TCP/UDP flows so return traffic of an allowed flow is
+  // permitted without an explicit reverse rule. Requires --acl.
+  bool stateful;
   // arg (the positional SOCK_STREAM socket; legacy QEMU `-netdev socket`)
   char *socket_path;
 };
