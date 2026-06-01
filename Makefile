@@ -145,6 +145,8 @@ test:
 	./test/acl_test
 	$(CC) $(TEST_CFLAGS) conntrack.c test/conntrack_test.c -o test/conntrack_test
 	./test/conntrack_test
+	$(CC) $(TEST_CFLAGS) -DVERSION='"test"' -DCLI_FAULT_INJECT cli.c test/cli_test.c -o test/cli_test
+	./test/cli_test
 
 # Coverage report for the unit-tested modules via llvm-cov.
 COVER_CFLAGS = $(TEST_CFLAGS) -fprofile-instr-generate -fcoverage-mapping
@@ -155,10 +157,14 @@ cover:
 	LLVM_PROFILE_FILE=acl.profraw ./test/acl_test >/dev/null
 	$(CC) $(COVER_CFLAGS) conntrack.c test/conntrack_test.c -o test/conntrack_test
 	LLVM_PROFILE_FILE=conntrack.profraw ./test/conntrack_test >/dev/null
+	$(CC) $(COVER_CFLAGS) -DVERSION='"test"' -DCLI_FAULT_INJECT cli.c test/cli_test.c -o test/cli_test
+	LLVM_PROFILE_FILE=cli.profraw ./test/cli_test >/dev/null
 	xcrun llvm-profdata merge -sparse acl.profraw -o acl.profdata
 	xcrun llvm-profdata merge -sparse conntrack.profraw -o conntrack.profdata
+	xcrun llvm-profdata merge -sparse cli.profraw -o cli.profdata
 	xcrun llvm-cov report ./test/acl_test -instr-profile=acl.profdata acl.c
 	xcrun llvm-cov report ./test/conntrack_test -instr-profile=conntrack.profdata conntrack.c
+	xcrun llvm-cov report ./test/cli_test -instr-profile=cli.profdata cli.c
 
 define make_artifacts
 	$(MAKE) clean

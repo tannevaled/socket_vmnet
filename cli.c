@@ -22,6 +22,19 @@
 
 #define CLI_DEFAULT_SOCKET_GROUP "staff"
 
+#ifdef CLI_FAULT_INJECT
+/* Test-only: make the next calloc fail once, to cover the OOM-exit path. */
+int cli_alloc_fail = 0;
+static void *cli_calloc(size_t a, size_t b) {
+  if (cli_alloc_fail) {
+    cli_alloc_fail = 0;
+    return NULL;
+  }
+  return calloc(a, b);
+}
+#define calloc cli_calloc
+#endif
+
 static void print_usage(const char *argv0) {
   printf("Usage: %s [OPTION]... SOCKET\n", argv0);
   printf("vmnet.framework support for rootless QEMU.\n");
