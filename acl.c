@@ -7,6 +7,30 @@
 #include "acl.h"
 #include "log.h"
 
+#ifdef ACL_FAULT_INJECT
+/* Test-only allocation fault injection. acl_alloc_budget < 0 disables;
+ * otherwise the (budget+1)-th allocation fails once (one-shot), letting the
+ * unit test sweep every defensive out-of-memory branch. Defined before the
+ * malloc/calloc/realloc macros so these wrappers themselves call libc. */
+int acl_alloc_budget = -1;
+static bool acl_should_fail(void) {
+  if (acl_alloc_budget < 0)
+    return false;
+  if (acl_alloc_budget == 0) {
+    acl_alloc_budget = -1;
+    return true;
+  }
+  acl_alloc_budget--;
+  return false;
+}
+static void *acl_malloc(size_t n) { return acl_should_fail() ? NULL : malloc(n); }
+static void *acl_calloc(size_t a, size_t b) { return acl_should_fail() ? NULL : calloc(a, b); }
+static void *acl_realloc(void *p, size_t n) { return acl_should_fail() ? NULL : realloc(p, n); }
+#define malloc acl_malloc
+#define calloc acl_calloc
+#define realloc acl_realloc
+#endif
+
 /* ===========================================================================
  * Minimal JSON parser (dependency-free)
  *
@@ -497,39 +521,11 @@ static bool parse_rule(const jnode *r, struct rule *out) {
   return true;
 }
 
-struct acl *acl_load(const char *path) {
-  FILE *fp = fopen(path, "rb");
-  if (fp == NULL) {
-    ERRORF("acl: cannot open \"%s\": %s", path, strerror(errno));
-    return NULL;
-  }
-  if (fseek(fp, 0, SEEK_END) != 0) {
-    ERRORN("acl: fseek");
-    fclose(fp);
-    return NULL;
-  }
-  long size = ftell(fp);
-  if (size < 0) {
-    ERRORN("acl: ftell");
-    fclose(fp);
-    return NULL;
-  }
-  rewind(fp);
-  char *data = malloc((size_t)size + 1);
-  if (data == NULL) {
-    ERRORN("acl: malloc");
-    fclose(fp);
-    return NULL;
-  }
-  size_t got = fread(data, 1, (size_t)size, fp);
-  fclose(fp);
-  data[got] = '\0';
-
-  jcur c = {.p = data, .end = data + got};
+struct acl *acl_parse(const char *json, size_t len) {
+  jcur c = {.p = json, .end = json + len};
   jnode *root = jparse_value(&c);
-  free(data);
   if (root == NULL) {
-    ERRORF("acl: failed to parse JSON in \"%s\"", path);
+    ERROR("acl: failed to parse JSON");
     return NULL;
   }
 
@@ -564,13 +560,50 @@ struct acl *acl_load(const char *path) {
   }
 
   jfree(root);
-  INFOF("acl: loaded %zu rule(s) from \"%s\" (default: %s)", acl->n, path,
+  INFOF("acl: loaded %zu rule(s) (default: %s)", acl->n,
         acl->default_action == ACL_ALLOW ? "allow" : "deny");
   return acl;
 err:
   jfree(root);
   acl_destroy(acl);
   return NULL;
+}
+
+/* Thin filesystem wrapper around acl_parse(). The defensive fseek/ftell/read
+ * error branches here are I/O glue and are not exercised by the unit test (it
+ * calls acl_parse directly); the parsing/matching logic is fully covered. */
+struct acl *acl_load(const char *path) {
+  FILE *fp = fopen(path, "rb");
+  if (fp == NULL) {
+    ERRORF("acl: cannot open \"%s\": %s", path, strerror(errno));
+    return NULL;
+  }
+  if (fseek(fp, 0, SEEK_END) != 0) {
+    ERRORN("acl: fseek");
+    fclose(fp);
+    return NULL;
+  }
+  long size = ftell(fp);
+  if (size < 0) {
+    ERRORN("acl: ftell");
+    fclose(fp);
+    return NULL;
+  }
+  rewind(fp);
+  char *data = malloc((size_t)size + 1);
+  if (data == NULL) {
+    ERRORN("acl: malloc");
+    fclose(fp);
+    return NULL;
+  }
+  size_t got = fread(data, 1, (size_t)size, fp);
+  fclose(fp);
+  data[got] = '\0';
+  struct acl *acl = acl_parse(data, got);
+  free(data);
+  if (acl == NULL)
+    ERRORF("acl: failed to load \"%s\"", path);
+  return acl;
 }
 
 void acl_destroy(struct acl *acl) {

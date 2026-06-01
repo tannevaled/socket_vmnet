@@ -125,6 +125,27 @@ uninstall: uninstall.launchd.plist uninstall.doc uninstall.bin uninstall.run
 .PHONY: clean
 clean:
 	rm -f socket_vmnet socket_vmnet_client *.o client/*.o
+	rm -f test/*_test *.profraw *.profdata
+
+# Unit tests for the dependency-free, vmnet-independent modules (run anywhere,
+# no root, no code signing). The vmnet datapath itself is validated separately
+# on real hardware (see DESIGN.md).
+TEST_CFLAGS ?= -I. -O0 -g -Wall -Wextra -DACL_FAULT_INJECT -fsanitize=address
+
+.PHONY: test
+test:
+	$(CC) $(TEST_CFLAGS) acl.c test/acl_test.c -o test/acl_test
+	./test/acl_test
+
+# Coverage report for the unit-tested modules via llvm-cov.
+.PHONY: cover
+cover:
+	rm -f *.profraw *.profdata
+	$(CC) $(TEST_CFLAGS) -fprofile-instr-generate -fcoverage-mapping \
+		acl.c test/acl_test.c -o test/acl_test
+	LLVM_PROFILE_FILE=acl.profraw ./test/acl_test >/dev/null
+	xcrun llvm-profdata merge -sparse acl.profraw -o cover.profdata
+	xcrun llvm-cov report ./test/acl_test -instr-profile=cover.profdata acl.c
 
 define make_artifacts
 	$(MAKE) clean

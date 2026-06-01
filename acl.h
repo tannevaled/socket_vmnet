@@ -25,6 +25,10 @@ enum acl_dir {
 // Load and compile an ACL from a JSON file. Returns NULL on error (logged).
 struct acl *acl_load(const char *path);
 
+// Parse and compile an ACL from an in-memory JSON buffer (no filesystem
+// access). Returns NULL on error (logged). Used by acl_load and by tests.
+struct acl *acl_parse(const char *json, size_t len);
+
 // Return true if `frame` (a full ethernet frame of `len` bytes) is permitted in
 // the given direction. Non-IPv4 frames (e.g. ARP, IPv6) are always allowed in
 // this first version; see ACL.md.
