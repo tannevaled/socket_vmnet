@@ -6,8 +6,9 @@
 #   task run        # build + run the daemon as root with the ACL (foreground)
 #
 # No toolchain installed? pkgx provides task + clang/llvm + make + go on demand:
-#   pkgx +taskfile.dev +llvm.org +gnu.org/make +go.dev -- task test
-#   ./taskw test    # uses `task` if present, otherwise the pkgx line above
+#   dev             # if pkgx `dev` is integrated: auto-activates pkgx.yaml deps
+#   ./taskw test    # uses `task` if present, otherwise pkgx provides everything
+#   pkgx +taskfile.dev +llvm.org +gnu.org/make +go.dev -- task test   # explicit
 # (AddressSanitizer is off by default for portability; on a system clang use
 #  `task test SANITIZE=address`.)
 #
