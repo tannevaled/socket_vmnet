@@ -130,7 +130,14 @@ clean:
 # Unit tests for the dependency-free, vmnet-independent modules (run anywhere,
 # no root, no code signing). The vmnet datapath itself is validated separately
 # on real hardware (see DESIGN.md).
-TEST_CFLAGS ?= -I. -O0 -g -Wall -Wextra -DACL_FAULT_INJECT -DCT_FAULT_INJECT -fsanitize=address
+# AddressSanitizer is opt-in (SANITIZE=address) because its runtime dylib is not
+# resolvable under every clang (e.g. a pkgx-provided toolchain). The default
+# build is portable; enable it on a system clang with `make test SANITIZE=address`.
+SANITIZE ?=
+TEST_CFLAGS := -I. -O0 -g -Wall -Wextra -DACL_FAULT_INJECT -DCT_FAULT_INJECT
+ifneq ($(strip $(SANITIZE)),)
+TEST_CFLAGS += -fsanitize=$(SANITIZE)
+endif
 
 .PHONY: test
 test:

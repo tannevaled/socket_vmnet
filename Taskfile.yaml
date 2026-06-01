@@ -5,9 +5,11 @@
 #   task cover      # coverage report (llvm-cov)
 #   task run        # build + run the daemon as root with the ACL (foreground)
 #
-# No go-task installed? Use pkgx, either directly or via the wrapper:
-#   pkgx task test
-#   ./taskw test    # uses `task` if present, otherwise `pkgx task`
+# No toolchain installed? pkgx provides task + clang/llvm + make + go on demand:
+#   pkgx +taskfile.dev +llvm.org +gnu.org/make +go.dev -- task test
+#   ./taskw test    # uses `task` if present, otherwise the pkgx line above
+# (AddressSanitizer is off by default for portability; on a system clang use
+#  `task test SANITIZE=address`.)
 #
 # Variables can be overridden, e.g.:
 #   task run GATEWAY=192.168.64.1 HCL=my-policy.hcl LIMA=default
