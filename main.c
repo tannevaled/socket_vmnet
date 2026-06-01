@@ -17,6 +17,7 @@
 #include <uuid/uuid.h>
 #include <vmnet/vmnet.h>
 
+#include "acl.h"
 #include "cli.h"
 #include "log.h"
 
@@ -117,6 +118,8 @@ struct state {
   bool interface_per_vm;
   // Parsed options, used to build per-client vmnet interfaces. Not owned.
   struct cli_options *cliopt;
+  // Optional stateless L3/L4 access-control list (--acl). NULL = allow all.
+  struct acl *acl;
 } _state;
 
 // A MAC is multicast (which includes broadcast ff:ff:ff:ff:ff:ff) when the
@@ -265,6 +268,12 @@ static void _on_vmnet_packets_available(interface_ref iface, int64_t buf_count, 
            src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5]);
     void *body = pdv[i].vm_pkt_iov[0].iov_base;
     uint32_t body_len = (uint32_t)pdv[i].vm_pkt_size; // not vm_pkt_iov[0].iov_len
+
+    // Phase 3: drop ingress frames denied by the ACL before delivering them.
+    if (!acl_allows(state->acl, ACL_INGRESS, body, body_len)) {
+      DEBUGF("[Handler i=%d] Dropped by ACL (ingress)", i);
+      continue;
+    }
 
     // --interface-per-vm (Phase 2): this interface belongs to a single client
     // and vmnet.framework already delivered only that client's frames, so there
@@ -672,6 +681,11 @@ static void on_dgram_readable(struct state *state, int dgram_fd, interface_ref s
       }
     }
 
+    if (!acl_allows(state->acl, ACL_EGRESS, buf, len)) {
+      DEBUGF("%s", "Datagram dropped by ACL (egress)");
+      continue;
+    }
+
     interface_ref iface = state->interface_per_vm ? conn->iface : shared_iface;
     if (iface == NULL)
       continue;
@@ -754,6 +768,14 @@ int main(int argc, char *argv[]) {
   if (state.isolated) {
     INFOF("%s", "Guest-to-guest isolation is enabled (--isolated)");
   }
+  if (cliopt->acl_path != NULL) {
+    state.acl = acl_load(cliopt->acl_path);
+    if (state.acl == NULL) {
+      // Error already logged. Fail closed: refuse to start rather than run
+      // unfiltered when an ACL was explicitly requested.
+      goto done;
+    }
+  }
 
   state.sem = dispatch_semaphore_create(1);
 
@@ -829,6 +851,7 @@ done:
     close(dgram_fd);
   }
   free(dgram_buf);
+  acl_destroy(state.acl);
   if (pidfile_fd != -1) {
     remove_pidfile(cliopt->pidfile);
     close(pidfile_fd);
@@ -903,6 +926,13 @@ static void on_accept(struct state *state, struct conn *conn, interface_ref shar
       dispatch_semaphore_wait(state->sem, DISPATCH_TIME_FOREVER);
       conn_learn_mac(conn, src_mac);
       dispatch_semaphore_signal(state->sem);
+    }
+
+    // Phase 3: drop egress frames denied by the ACL (no vmnet write, no
+    // guest-to-guest forwarding).
+    if (!acl_allows(state->acl, ACL_EGRESS, buf, header)) {
+      DEBUGF("[Socket-to-VMNET i=%lld] Dropped by ACL (egress)", i);
+      continue;
     }
 
     DEBUGF("[Socket-to-VMNET i=%lld] Sending to VMNET: %u bytes", i, header);

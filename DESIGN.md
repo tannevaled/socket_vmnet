@@ -6,11 +6,13 @@ datagram-based interface"), and the adjacent issues
 [#58][issue-58] (bad scaling due to flooding) and [#13][issue-13]
 (`VZFileHandleNetworkDeviceAttachment` support).
 
-It is organized in three phases. **All three are now implemented in this
-branch and build cleanly with `-Wall -Wextra -pedantic` + `clang-format`.**
-None of it has been exercised at runtime yet: `vmnet` is gated behind SIP and
-requires an Apple-Developer-signed binary, so the behavior must be validated on
-real, code-signed macOS hardware (see [Validation](#validation)).
+It is organized in phases (0–3). **All are implemented in this branch and build
+cleanly with `-Wall -Wextra -pedantic` + `clang-format`.** The vmnet datapath has
+not been exercised at runtime yet: `vmnet` is gated behind SIP and requires an
+Apple-Developer-signed binary, so it must be validated on real, code-signed
+macOS hardware (see [Validation](#validation)). The Phase 3 ACL engine, by
+contrast, is pure logic and **is** covered by an offline unit test
+(`test/acl_test.c`).
 
 ## Problem
 
@@ -114,6 +116,30 @@ each with its own random `vmnet_interface_id`.
   reclaimed by the OS on process exit (their reader threads are blocked in
   `read`); the common path (client disconnect) stops the interface in
   `on_accept`. Graceful per-connection teardown on `SIGTERM` is a follow-up.
+
+## Phase 3 — targeted L3/L4 filtering (`--acl`)
+
+A **stateless** access-control list applied at the daemon, which is the natural
+chokepoint for every frame. Rationale, schema, HCL authoring and limitations are
+in [`ACL.md`](ACL.md); in brief:
+
+- `acl.c` is a dependency-free module: a tiny JSON parser + a first-match-wins
+  matcher over ethernet/IPv4/TCP/UDP/ICMP (MAC, CIDR, proto, port/range,
+  direction). Public API in `acl.h`: `acl_load` / `acl_allows` / `acl_destroy`.
+- Enforced at egress (`on_accept`, `on_dgram_readable`) and ingress
+  (`_on_vmnet_packets_available`); deny drops the frame. A bad `--acl` file makes
+  the daemon fail closed (refuse to start).
+- Authored in HCL and compiled to the daemon's compact JSON by the Go helper
+  `contrib/hcl2acl` (groups + member MACs + rules → flat MAC-matched rules).
+
+Why here and not `pf`: `pfctl` needs root **and** mutates global host firewall
+state, against the rootless-client model; the daemon already runs as root and
+the ACL is scoped to its own traffic. Why stateless first: conntrack is the bulk
+of the cost/complexity; a stateless allow/deny already covers targeted policies.
+Unlike the vmnet paths, `acl.c` is unit-tested offline (`test/acl_test.c`).
+
+Follow-ups: stateful conntrack (return-traffic), IPv6, per-group live reload
+(SIGHUP).
 
 ## How the pieces compose
 

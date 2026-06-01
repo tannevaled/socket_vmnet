@@ -39,6 +39,9 @@ struct cli_options {
   // VZFileHandleNetworkDeviceAttachment. The positional stream socket keeps the
   // legacy uint32be-length-prefixed protocol.
   char *socket_dgram_path;
+  // --acl=PATH (Phase 3); JSON access-control list (see hcl2acl) applied to
+  // guest egress and ingress for targeted L3/L4 filtering.
+  char *acl_path;
   // arg (the positional SOCK_STREAM socket; legacy QEMU `-netdev socket`)
   char *socket_path;
 };

@@ -375,6 +375,20 @@ socket_vmnet --vmnet-gateway=192.168.105.1 \
 The client must `bind(2)` a local address so that replies can be delivered;
 datagrams from an unbound peer are dropped.
 
+### Targeted filtering (ACL)
+
+`--acl=PATH` applies a stateless L3/L4 access-control list (MAC / CIDR / proto /
+port, per direction) to guest traffic, filtered in the daemon itself — no `pf`,
+no per-guest setup. Policy is authored in HCL and compiled to JSON by the
+`contrib/hcl2acl` helper:
+
+```bash
+go run ./contrib/hcl2acl example.hcl > example.acl.json
+socket_vmnet --acl=example.acl.json /var/run/socket_vmnet
+```
+
+See [`ACL.md`](./ACL.md) for the schema, examples, and limitations.
+
 ### Bridged mode
 
 See [`./launchd/io.github.lima-vm.socket_vmnet.bridged.en0.plist`](./launchd/io.github.lima-vm.socket_vmnet.bridged.en0.plist).

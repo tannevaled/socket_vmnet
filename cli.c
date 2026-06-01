@@ -76,6 +76,10 @@ static void print_usage(const char *argv0) {
          "SOCK_DGRAM endpoint for\n");
   printf("                                    QEMU `-netdev dgram` and VZ "
          "(Phase 0)\n");
+  printf("--acl=PATH                          JSON access-control list for "
+         "L3/L4 filtering\n");
+  printf("                                    (see the hcl2acl helper) "
+         "(Phase 3)\n");
   printf("-h, --help                          display this help and exit\n");
   printf("-v, --version                       display version information and "
          "exit\n");
@@ -98,6 +102,7 @@ enum {
   CLI_OPT_ISOLATED,
   CLI_OPT_INTERFACE_PER_VM,
   CLI_OPT_SOCKET_DGRAM,
+  CLI_OPT_ACL,
 };
 
 struct cli_options *cli_options_parse(int argc, char *argv[]) {
@@ -120,6 +125,7 @@ struct cli_options *cli_options_parse(int argc, char *argv[]) {
       {"isolated",                 no_argument,       NULL, CLI_OPT_ISOLATED                },
       {"interface-per-vm",         no_argument,       NULL, CLI_OPT_INTERFACE_PER_VM        },
       {"socket-dgram",             required_argument, NULL, CLI_OPT_SOCKET_DGRAM            },
+      {"acl",                      required_argument, NULL, CLI_OPT_ACL                     },
       {"pidfile",                  required_argument, NULL, 'p'                             },
       {"help",                     no_argument,       NULL, 'h'                             },
       {"version",                  no_argument,       NULL, 'v'                             },
@@ -178,6 +184,9 @@ struct cli_options *cli_options_parse(int argc, char *argv[]) {
       break;
     case CLI_OPT_SOCKET_DGRAM:
       res->socket_dgram_path = strdup(optarg);
+      break;
+    case CLI_OPT_ACL:
+      res->acl_path = strdup(optarg);
       break;
     case 'p':
       res->pidfile = strdup(optarg);
@@ -277,5 +286,6 @@ void cli_options_destroy(struct cli_options *x) {
   free(x->vmnet_nat66_prefix);
   free(x->pidfile);
   free(x->socket_dgram_path);
+  free(x->acl_path);
   free(x);
 }
