@@ -1,0 +1,21 @@
+#!/bin/sh
+# Run go-task. If task is not installed, fall back to pkgx, which also provides
+# the full build/test toolchain (clang/llvm, make, go) on demand -- so this
+# works with nothing pre-installed beyond pkgx itself.
+#
+#   ./taskw            # list tasks
+#   ./taskw test       # run a task
+#
+# See Taskfile.yaml for the available tasks.
+set -eu
+
+if command -v task >/dev/null 2>&1; then
+  exec task "$@"
+fi
+if command -v pkgx >/dev/null 2>&1; then
+  exec pkgx +taskfile.dev +llvm.org +gnu.org/make +go.dev -- task "$@"
+fi
+
+echo "taskw: neither 'task' nor 'pkgx' was found." >&2
+echo "       Install go-task (https://taskfile.dev) or pkgx (https://pkgx.sh)." >&2
+exit 127

@@ -1,6 +1,7 @@
 #ifndef SOCKET_VMNET_CLI_H
 #define SOCKET_VMNET_CLI_H
 
+#include <stdbool.h>
 #include <uuid/uuid.h>
 
 #include <vmnet/vmnet.h>
@@ -26,7 +27,25 @@ struct cli_options {
   char *vmnet_nat66_prefix;
   // -p, --pidfile; writes pidfile using permissions of socket_vmnet
   char *pidfile;
-  // arg
+  // --isolated; drop guest-to-guest traffic (guests can still reach the
+  // gateway/NAT, but they cannot see each other). In --interface-per-vm mode
+  // this is enforced by vmnet's own isolation key (hard, non-spoofable).
+  bool isolated;
+  // --interface-per-vm (Phase 2); start a dedicated vmnet interface per client
+  // so that vmnet.framework performs the L2 switching itself
+  bool interface_per_vm;
+  // --socket-dgram=PATH (Phase 0); additional header-less SOCK_DGRAM endpoint,
+  // consumed by QEMU `-netdev dgram` and Apple's
+  // VZFileHandleNetworkDeviceAttachment. The positional stream socket keeps the
+  // legacy uint32be-length-prefixed protocol.
+  char *socket_dgram_path;
+  // --acl=PATH (Phase 3); JSON access-control list (see hcl2acl) applied to
+  // guest egress and ingress for targeted L3/L4 filtering.
+  char *acl_path;
+  // --stateful; track TCP/UDP flows so return traffic of an allowed flow is
+  // permitted without an explicit reverse rule. Requires --acl.
+  bool stateful;
+  // arg (the positional SOCK_STREAM socket; legacy QEMU `-netdev socket`)
   char *socket_path;
 };
 

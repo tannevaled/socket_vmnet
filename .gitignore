@@ -2,3 +2,10 @@
 /socket_vmnet_client
 *.o
 _artifacts*
+# unit-test / coverage artifacts
+/test/*_test
+*.dSYM/
+*.profraw
+*.profdata
+# Go helper build output
+/hcl2acl

@@ -1,0 +1,14 @@
+# pkgx dev-environment manifest (https://docs.pkgx.sh / github.com/pkgxdev/dev).
+#
+# With pkgx's `dev` shell integration active, `cd`-ing into this directory (or
+# running `dev`) puts the full build/test toolchain on PATH automatically:
+#
+#   dev            # activate (once per shell session in this dir)
+#   task test      # then build/test/cover without any system install
+#
+# Without `dev`, the same set is available via:  ./taskw <task>
+dependencies:
+  taskfile.dev: '*'   # the `task` runner
+  llvm.org: '*'       # clang, clang-format, llvm-cov, llvm-profdata
+  gnu.org/make: '*'   # make
+  go.dev: '*'         # the hcl2acl helper

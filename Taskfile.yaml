@@ -1,0 +1,159 @@
+# Taskfile for socket_vmnet (https://taskfile.dev).
+#
+#   task            # list tasks
+#   task test       # unit tests (ASan)
+#   task cover      # coverage report (llvm-cov)
+#   task run        # build + run the daemon as root with the ACL (foreground)
+#
+# No toolchain installed? pkgx provides task + clang/llvm + make + go on demand:
+#   dev             # if pkgx `dev` is integrated: auto-activates pkgx.yaml deps
+#   ./taskw test    # uses `task` if present, otherwise pkgx provides everything
+#   pkgx +taskfile.dev +llvm.org +gnu.org/make +go.dev -- task test   # explicit
+# (AddressSanitizer is off by default for portability; on a system clang use
+#  `task test SANITIZE=address`.)
+#
+# Variables can be overridden, e.g.:
+#   task run GATEWAY=192.168.64.1 HCL=my-policy.hcl LIMA=default
+version: "3"
+
+vars:
+  SOCKET: /tmp/socket_vmnet.acl
+  DGRAM: /tmp/socket_vmnet.dgram
+  PIDFILE: /tmp/socket_vmnet.pid
+  GATEWAY: 192.168.105.1
+  HCL: contrib/hcl2acl/example.hcl
+  ACL_JSON: /tmp/policy.acl.json
+  LIMA: default
+
+tasks:
+  default:
+    desc: List available tasks
+    cmds:
+      - task --list
+    silent: true
+
+  # ---- build & quality ----
+
+  build:
+    desc: Build the daemon and client
+    cmds:
+      - make all
+
+  fmt:
+    desc: Format C sources with clang-format
+    cmds:
+      - clang-format -i *.c *.h client/*.c test/*.c
+
+  test:
+    desc: Run the offline unit tests (ASan) — no vmnet, no root
+    cmds:
+      - make test
+
+  cover:
+    desc: Coverage report for the unit-tested modules (llvm-cov)
+    cmds:
+      - make cover
+
+  hcl2acl:
+    desc: Build and gofmt-check the HCL->JSON helper
+    dir: contrib/hcl2acl
+    cmds:
+      - go build -o /tmp/hcl2acl .
+      - test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+
+  clean:
+    desc: Remove build, test and coverage artifacts
+    cmds:
+      - make clean
+
+  # ---- policy ----
+
+  policy:
+    desc: Compile the HCL policy ({{.HCL}}) to JSON ({{.ACL_JSON}})
+    deps: [hcl2acl]
+    cmds:
+      # /tmp/hcl2acl is built by the hcl2acl task (its module lives in
+      # contrib/hcl2acl); invoke it from the repo root so {{.HCL}} resolves.
+      - /tmp/hcl2acl {{.HCL}} > {{.ACL_JSON}}
+      - 'echo "Wrote {{.ACL_JSON}}:" && cat {{.ACL_JSON}}'
+
+  # ---- live daemon (requires root for vmnet) ----
+
+  run:
+    desc: Run the daemon as root with ACL + stateful filtering (foreground, Ctrl-C to stop)
+    deps: [build, policy]
+    interactive: true
+    cmds:
+      - |
+        sudo ./socket_vmnet \
+          --vmnet-gateway={{.GATEWAY}} \
+          --acl={{.ACL_JSON}} --stateful \
+          --socket-dgram={{.DGRAM}} \
+          --pidfile={{.PIDFILE}} \
+          {{.SOCKET}}
+
+  run:debug:
+    desc: Same as run, with DEBUG logging (shows ACL drops / MAC learning)
+    deps: [build, policy]
+    interactive: true
+    cmds:
+      - |
+        sudo DEBUG=1 ./socket_vmnet \
+          --vmnet-gateway={{.GATEWAY}} \
+          --acl={{.ACL_JSON}} --stateful \
+          --socket-dgram={{.DGRAM}} \
+          --pidfile={{.PIDFILE}} \
+          {{.SOCKET}}
+
+  reload:
+    desc: Hot-reload the ACL (SIGHUP) after editing the policy
+    deps: [policy]
+    cmds:
+      - sudo kill -HUP "$(cat {{.PIDFILE}})"
+      - 'echo "Sent SIGHUP to pid $(cat {{.PIDFILE}})"'
+
+  stop:
+    desc: Stop the running daemon
+    cmds:
+      - sudo kill "$(cat {{.PIDFILE}})" 2>/dev/null || true
+
+  # ---- Lima integration ----
+
+  lima:snippet:
+    desc: Print the Lima network snippet to point an instance at the daemon socket
+    silent: true
+    cmds:
+      - |
+        echo "Add to ~/.lima/{{.LIMA}}/lima.yaml (or an override), then 'task lima:start':"
+        echo ""
+        echo "networks:"
+        echo "  - socket: \"{{.SOCKET}}\""
+
+  lima:start:
+    desc: Start the Lima instance ({{.LIMA}}) — daemon (task run) must already be up
+    cmds:
+      - limactl start {{.LIMA}}
+
+  lima:shell:
+    desc: Open a shell in the Lima instance to test connectivity
+    cmds:
+      - limactl shell {{.LIMA}}
+
+  lima:stop:
+    desc: Stop the Lima instance
+    cmds:
+      - limactl stop {{.LIMA}}
+
+  # ---- end-to-end helper ----
+
+  e2e:
+    desc: "Print the full live-test sequence (run in separate terminals)"
+    silent: true
+    cmds:
+      - |
+        echo "1. Terminal A:  task run          # daemon as root (enter password)"
+        echo "2. One-time:    task lima:snippet  # add the network to {{.LIMA}}"
+        echo "3. Terminal B:  task lima:start && task lima:shell"
+        echo "                # in the VM: curl / ping to check allowed vs denied"
+        echo "4. Edit {{.HCL}}, then:  task reload   # SIGHUP hot-reload"
+        echo "5. Cleanup:     task stop && task lima:stop"
