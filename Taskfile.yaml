@@ -5,6 +5,10 @@
 #   task cover      # coverage report (llvm-cov)
 #   task run        # build + run the daemon as root with the ACL (foreground)
 #
+# No go-task installed? Use pkgx, either directly or via the wrapper:
+#   pkgx task test
+#   ./taskw test    # uses `task` if present, otherwise `pkgx task`
+#
 # Variables can be overridden, e.g.:
 #   task run GATEWAY=192.168.64.1 HCL=my-policy.hcl LIMA=default
 version: "3"

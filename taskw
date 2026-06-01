@@ -1,0 +1,19 @@
+#!/bin/sh
+# Run go-task, falling back to `pkgx task` when task is not installed.
+#
+#   ./taskw            # list tasks
+#   ./taskw test       # run a task
+#
+# See Taskfile.yaml for the available tasks.
+set -eu
+
+if command -v task >/dev/null 2>&1; then
+  exec task "$@"
+fi
+if command -v pkgx >/dev/null 2>&1; then
+  exec pkgx task "$@"
+fi
+
+echo "taskw: neither 'task' nor 'pkgx' was found." >&2
+echo "       Install go-task (https://taskfile.dev) or pkgx (https://pkgx.sh)." >&2
+exit 127
