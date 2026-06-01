@@ -21,6 +21,7 @@
 #include "acl.h"
 #include "cli.h"
 #include "conntrack.h"
+#include "forward.h"
 #include "log.h"
 
 #if __MAC_OS_X_VERSION_MAX_ALLOWED < 101500
@@ -77,34 +78,9 @@ static void print_vmnet_start_param(xpc_object_t param) {
   });
 }
 
-// Wire transport used to talk to a client.
-enum transport {
-  TRANSPORT_STREAM, // legacy QEMU `-netdev socket`: uint32be length header
-  TRANSPORT_DGRAM,  // QEMU `-netdev dgram` / VZ file handle: one datagram == one frame
-};
-
-struct conn {
-  // Source MAC learned from the guest's egress frames. Used to switch unicast
-  // traffic to a single client instead of flooding every connection.
-  uint8_t mac[6];
-  bool mac_known;
-
-  enum transport transport;
-  // STREAM: the accepted per-client fd.
-  // DGRAM:  the shared datagram listener fd; the client is identified by `peer`.
-  int socket_fd;
-  struct sockaddr_un peer; // DGRAM only: address to sendto()
-  socklen_t peer_len;      // DGRAM only
-
-  // --interface-per-vm (Phase 2): a dedicated vmnet interface for this client,
-  // so that vmnet.framework performs the L2 switching. NULL when a single
-  // shared interface is used (Phase 1).
-  interface_ref iface;
-  uint64_t max_bytes;
-
-  struct conn *next;
-} _conn;
-
+// The connection bookkeeping, MAC switch and frame forwarding live in forward.c
+// (vmnet-independent and unit-tested). struct conn / enum transport come from
+// forward.h.
 struct state {
   dispatch_semaphore_t sem;
   dispatch_queue_t vms_queue;
@@ -146,102 +122,20 @@ static bool frame_allowed(struct state *state, enum acl_dir dir, const void *buf
   return allow;
 }
 
-// A MAC is multicast (which includes broadcast ff:ff:ff:ff:ff:ff) when the
-// least-significant bit of the first octet is set. Such frames must be flooded.
-static inline bool mac_is_multicast(const uint8_t mac[6]) { return (mac[0] & 0x01) != 0; }
-
-// Find the connection that previously advertised mac as its own.
-// The caller must hold state->sem.
-static struct conn *conn_find_by_mac(struct state *state, const uint8_t mac[6]) {
-  for (struct conn *c = state->conns; c != NULL; c = c->next) {
-    if (c->mac_known && memcmp(c->mac, mac, sizeof(c->mac)) == 0)
-      return c;
-  }
-  return NULL;
-}
-
-// Associate src_mac with conn (MAC learning). Multicast/broadcast addresses are
-// never valid as a source and are ignored. The caller must hold state->sem.
-static void conn_learn_mac(struct conn *conn, const uint8_t src_mac[6]) {
-  if (mac_is_multicast(src_mac))
-    return;
-  if (!conn->mac_known || memcmp(conn->mac, src_mac, sizeof(conn->mac)) != 0) {
-    memcpy(conn->mac, src_mac, sizeof(conn->mac));
-    conn->mac_known = true;
-    DEBUGF("Learned MAC %02X:%02X:%02X:%02X:%02X:%02X on socket %d", src_mac[0], src_mac[1],
-           src_mac[2], src_mac[3], src_mac[4], src_mac[5], conn->socket_fd);
-  }
-}
-
-// Send a single ethernet frame to a client. STREAM connections are prefixed
-// with the uint32be length header expected by the legacy QEMU protocol; DGRAM
-// connections send the raw frame as one datagram (no header).
-static void conn_send_frame(struct conn *conn, const void *body, uint32_t len) {
-  if (conn->transport == TRANSPORT_DGRAM) {
-    ssize_t written =
-        sendto(conn->socket_fd, body, len, 0, (const struct sockaddr *)&conn->peer, conn->peer_len);
-    if (written < 0) {
-      ERRORN("sendto");
-    }
-    return;
-  }
-  uint32_t header_be = htonl(len);
-  struct iovec iov[2] = {
-      {.iov_base = &header_be,   .iov_len = 4  },
-      {.iov_base = (void *)body, .iov_len = len},
-  };
-  ssize_t written = writev(conn->socket_fd, iov, 2);
-  if (written < 0) {
-    ERRORN("writev");
-  }
-}
-
-// The caller must hold state->sem.
-static void state_append_conn_locked(struct state *state, struct conn *conn) {
-  if (state->conns == NULL) {
-    state->conns = conn;
-  } else {
-    struct conn *last;
-    for (last = state->conns; last->next != NULL; last = last->next)
-      ;
-    last->next = conn;
-  }
-}
-
+// Allocate and register a stream connection (locks state->sem).
 static struct conn *state_add_stream_conn(struct state *state, int socket_fd) {
   struct conn *conn = calloc(1, sizeof(*conn));
   conn->transport = TRANSPORT_STREAM;
   conn->socket_fd = socket_fd;
   dispatch_semaphore_wait(state->sem, DISPATCH_TIME_FOREVER);
-  state_append_conn_locked(state, conn);
+  conn_list_append(&state->conns, conn);
   dispatch_semaphore_signal(state->sem);
   return conn;
 }
 
-// Find the datagram connection for a given peer, or NULL.
-// The caller must hold state->sem.
-static struct conn *state_find_dgram_conn(struct state *state, int dgram_fd,
-                                          const struct sockaddr_un *peer, socklen_t peer_len) {
-  for (struct conn *c = state->conns; c != NULL; c = c->next) {
-    if (c->transport == TRANSPORT_DGRAM && c->socket_fd == dgram_fd && c->peer_len == peer_len &&
-        memcmp(&c->peer, peer, peer_len) == 0)
-      return c;
-  }
-  return NULL;
-}
-
 static void state_remove_conn(struct state *state, struct conn *target) {
   dispatch_semaphore_wait(state->sem, DISPATCH_TIME_FOREVER);
-  if (state->conns == target) {
-    state->conns = target->next;
-  } else {
-    for (struct conn *c = state->conns; c->next != NULL; c = c->next) {
-      if (c->next == target) {
-        c->next = target->next;
-        break;
-      }
-    }
-  }
+  conn_list_remove(&state->conns, target);
   dispatch_semaphore_signal(state->sem);
 }
 
@@ -309,35 +203,12 @@ static void _on_vmnet_packets_available(interface_ref iface, int64_t buf_count, 
       continue;
     }
 
-    // Shared interface (Phase 1): switched forwarding. Deliver unicast frames
-    // only to the client that owns the destination MAC. Multicast/broadcast and
-    // not-yet-learned unicast are flooded, exactly like a learning ethernet
-    // switch. This replaces the previous unconditional flood (one copy per
-    // connection).
-    //
-    // This path carries traffic coming from vmnet (NAT/external/other hosts on
-    // a bridged segment), so it is delivered regardless of --isolated; isolation
-    // only governs direct guest-to-guest forwarding (see on_accept).
+    // Shared interface (Phase 1): switch the frame to the owning client (or
+    // flood multicast/broadcast/unknown). This path carries traffic from vmnet
+    // (NAT/external/bridged peers), so it is delivered regardless of --isolated;
+    // isolation only governs direct guest-to-guest forwarding (see on_accept).
     dispatch_semaphore_wait(state->sem, DISPATCH_TIME_FOREVER);
-    struct conn *target = NULL;
-    bool flood = mac_is_multicast(dest_mac);
-    if (!flood) {
-      target = conn_find_by_mac(state, dest_mac);
-      if (target == NULL)
-        flood = true; // unknown unicast: flood until the MAC is learned
-    }
-    if (flood) {
-      for (struct conn *conn = state->conns; conn != NULL; conn = conn->next) {
-        DEBUGF("[Handler i=%d] Flooding to socket %d: 4 + %u bytes", i, conn->socket_fd, body_len);
-        conn_send_frame(conn, body, body_len);
-      }
-    } else {
-      DEBUGF("[Handler i=%d] Switching to socket %d: 4 + %u bytes [Dest "
-             "%02X:%02X:%02X:%02X:%02X:%02X]",
-             i, target->socket_fd, body_len, dest_mac[0], dest_mac[1], dest_mac[2], dest_mac[3],
-             dest_mac[4], dest_mac[5]);
-      conn_send_frame(target, body, body_len);
-    }
+    forward_switch(state->conns, NULL, dest_mac, body, body_len);
     dispatch_semaphore_signal(state->sem);
   }
 done:
@@ -625,28 +496,12 @@ static bool vmnet_write_frame(interface_ref iface, void *body, uint32_t len) {
 }
 
 // Forward a guest's frame to the other guests sharing the single interface
-// (Phase 1). vmnet does not loop same-network frames back to us, so we switch
-// (unicast) or flood (multicast/broadcast/unknown) them ourselves. The sender
-// is never echoed. The caller must NOT hold state->sem.
+// (Phase 1): switch to the owning client (or flood), never echoing the sender.
+// vmnet does not loop same-network frames back to us. Locks state->sem.
 static void forward_guest_to_guest(struct state *state, struct conn *sender, const void *body,
                                    uint32_t len, const uint8_t dest_mac[6]) {
   dispatch_semaphore_wait(state->sem, DISPATCH_TIME_FOREVER);
-  struct conn *target = NULL;
-  bool flood = mac_is_multicast(dest_mac);
-  if (!flood) {
-    target = conn_find_by_mac(state, dest_mac);
-    if (target == NULL)
-      flood = true; // unknown unicast: flood until the MAC is learned
-  }
-  if (flood) {
-    for (struct conn *c = state->conns; c != NULL; c = c->next) {
-      if (c == sender)
-        continue;
-      conn_send_frame(c, body, len);
-    }
-  } else if (target != sender) {
-    conn_send_frame(target, body, len);
-  }
+  forward_switch(state->conns, sender, dest_mac, body, len);
   dispatch_semaphore_signal(state->sem);
 }
 
@@ -682,7 +537,7 @@ static void on_dgram_readable(struct state *state, int dgram_fd, interface_ref s
     }
 
     dispatch_semaphore_wait(state->sem, DISPATCH_TIME_FOREVER);
-    struct conn *conn = state_find_dgram_conn(state, dgram_fd, &peer, peer_len);
+    struct conn *conn = conn_find_dgram(state->conns, dgram_fd, &peer, peer_len);
     bool created = false;
     if (conn == NULL) {
       conn = calloc(1, sizeof(*conn));
@@ -690,7 +545,7 @@ static void on_dgram_readable(struct state *state, int dgram_fd, interface_ref s
       conn->socket_fd = dgram_fd;
       memcpy(&conn->peer, &peer, peer_len);
       conn->peer_len = peer_len;
-      state_append_conn_locked(state, conn);
+      conn_list_append(&state->conns, conn);
       created = true;
     }
     if (eth_parsed)
