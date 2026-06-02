@@ -1,0 +1,7 @@
+{ "default_action": "allow",
+  "rules": [
+    { "action": "allow", "direction": "ingress", "proto": "tcp",
+      "src_mac": "de:ad:be:ef:00:01", "dst_port": 443 },
+    { "action": "deny", "direction": "egress", "dst_cidr": "10.0.0.0/8" },
+    { "action": "deny", "direction": "egress", "proto": "tcp", "dst_port": 25 }
+  ] }

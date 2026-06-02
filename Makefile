@@ -149,11 +149,20 @@ endif
 # socket_vmnet's own vmnet-independent units. The ACL / conntrack / HCL engines
 # now live in libfw/c-fw and are tested in that repo.
 .PHONY: test
-test:
+test: test.acl
 	$(CC) $(TEST_CFLAGS) -DVERSION='"test"' -DCLI_FAULT_INJECT cli.c test/cli_test.c -o test/cli_test
 	./test/cli_test
 	$(CC) $(TEST_CFLAGS) forward.c test/forward_test.c -o test/forward_test
 	./test/forward_test
+
+# Offline integration smoke for the ACL front-end: builds the daemon and checks
+# that good .hcl/.json rulesets load (and reach vmnet) while a malformed one
+# fails closed. Needs the vmnet framework to link, but no root. The full
+# datapath test (frames through a VM) needs root + Lima -- see
+# ACL.md ("Testing the ACL integration").
+.PHONY: test.acl
+test.acl: socket_vmnet
+	sh test/acl_smoke.sh
 
 # Coverage report for the unit-tested modules via llvm-cov.
 COVER_CFLAGS = $(TEST_CFLAGS) -fprofile-instr-generate -fcoverage-mapping

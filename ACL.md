@@ -135,3 +135,52 @@ kept and an error is logged.
   if the next header is an extension header, transport ports are not matched.
 - **`icmp` vs `icmpv6`.** `proto = "icmp"` matches IPv4 ICMP (1); use
   `proto = "icmpv6"` (58) for IPv6.
+
+## Testing the ACL integration
+
+### Offline smoke (no root)
+
+`make test.acl` builds the daemon and runs `test/acl_smoke.sh`, which exercises
+the real daemon load path — `main.c`'s `load_acl_file` → libfw/c-fw
+`acl_load_hcl` (via libhcl/c-hcl) for `.hcl`, `acl_load` (via the built-in JSON
+parser) for `.json`. The daemon only *warns* when run without root and loads the
+ACL **before** it touches vmnet.framework, so the smoke can assert:
+
+- a valid `.hcl` / `.json` ruleset is reported as `acl: loaded N rule(s)` and
+  the run proceeds to the (expected) `vmnet_start_interface` failure;
+- a malformed ruleset fails closed (`failed to compile`) and never reaches
+  vmnet.
+
+This is run as part of `make test`. It does **not** move any frames — it proves
+the parse/load wiring, not the datapath.
+
+### Live test (needs root + a Lima guest)
+
+The datapath itself — frames actually filtered as they flow through a guest —
+requires `vmnet.framework`, which needs **root** and a code-signed binary, plus
+a real VM. This cannot run in CI/sandbox; do it manually:
+
+```bash
+# 1. Build + install (signs the binary, installs the launchd helper).
+make
+sudo make install                      # or: install.bin install.launchd
+
+# 2. Author a policy and start the daemon with it (root, via launchd or directly).
+sudo socket_vmnet --acl=/etc/socket_vmnet/acl.hcl \
+                  --vmnet-gateway=192.168.105.1 \
+                  /var/run/socket_vmnet
+
+# 3. Point a Lima VM at the socket and boot it.
+#    In the lima.yaml networks: stanza:
+#      networks:
+#        - socket: "/var/run/socket_vmnet"
+limactl start ./lima.yaml
+
+# 4. From inside the guest, verify the policy:
+#    - an "allow" destination succeeds, a "deny" one times out / is refused;
+#    - return traffic of an allowed flow passes (with --stateful);
+#    - `kill -HUP $(cat /var/run/socket_vmnet.pid)` hot-reloads the ruleset.
+```
+
+Frames not matched by any rule fall through to `default_action`. See the
+`--stateful` and SIGHUP sections above for conntrack and live-reload behavior.
