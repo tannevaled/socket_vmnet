@@ -1,0 +1,3 @@
+[submodule "third_party/c-fw"]
+	path = third_party/c-fw
+	url = https://github.com/libfw/c-fw

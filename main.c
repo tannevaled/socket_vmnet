@@ -18,11 +18,11 @@
 #include <uuid/uuid.h>
 #include <vmnet/vmnet.h>
 
-#include "acl.h"
+#include "acl.h"      /* libfw/c-fw */
+#include "acl_hcl.h"  /* libfw/c-fw (HCL front-end, via libhcl/c-hcl) */
 #include "cli.h"
-#include "conntrack.h"
+#include "conntrack.h" /* libfw/c-fw */
 #include "forward.h"
-#include "hcl.h"
 #include "log.h"
 
 #if __MAC_OS_X_VERSION_MAX_ALLOWED < 101500
@@ -108,7 +108,7 @@ struct state {
 static struct acl *load_acl_file(const char *path) {
   size_t n = strlen(path);
   if (n >= 4 && strcmp(path + n - 4, ".hcl") == 0)
-    return hcl_load(path);
+    return acl_load_hcl(path);
   return acl_load(path);
 }
 

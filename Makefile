@@ -24,6 +24,12 @@ VERSION_TRIMMED := $(VERSION:v%=%)
 
 CFLAGS += -DVERSION=\"$(VERSION)\"
 
+# libfw/c-fw provides the ACL + conntrack + HCL front-end (it vendors libhcl/c-hcl).
+CFW := third_party/c-fw
+CHCL := $(CFW)/third_party/c-hcl
+CFLAGS += -I$(CFW) -I$(CHCL)
+CFW_OBJS := $(CFW)/acl.o $(CFW)/conntrack.o $(CFW)/acl_hcl.o $(CHCL)/hcl.o
+
 LDFLAGS ?=
 VMNET_LDFLAGS = -framework vmnet
 
@@ -46,7 +52,7 @@ all: socket_vmnet socket_vmnet_client
 %.o: %.c *.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
-socket_vmnet: $(patsubst %.c, %.o, $(wildcard *.c))
+socket_vmnet: $(patsubst %.c, %.o, $(wildcard *.c)) $(CFW_OBJS)
 	$(CC) $(CFLAGS) -o $@ $(LDFLAGS) $(VMNET_LDFLAGS) $^
 
 socket_vmnet_client: $(patsubst %.c, %.o, $(wildcard client/*.c))
@@ -125,6 +131,7 @@ uninstall: uninstall.launchd.plist uninstall.doc uninstall.bin uninstall.run
 .PHONY: clean
 clean:
 	rm -f socket_vmnet socket_vmnet_client *.o client/*.o
+	rm -f $(CFW_OBJS)
 	rm -f test/*_test *.profraw *.profdata
 
 # Unit tests for the dependency-free, vmnet-independent modules (run anywhere,
@@ -139,44 +146,28 @@ ifneq ($(strip $(SANITIZE)),)
 TEST_CFLAGS += -fsanitize=$(SANITIZE)
 endif
 
+# socket_vmnet's own vmnet-independent units. The ACL / conntrack / HCL engines
+# now live in libfw/c-fw and are tested in that repo.
 .PHONY: test
 test:
-	$(CC) $(TEST_CFLAGS) acl.c test/acl_test.c -o test/acl_test
-	./test/acl_test
-	$(CC) $(TEST_CFLAGS) conntrack.c test/conntrack_test.c -o test/conntrack_test
-	./test/conntrack_test
 	$(CC) $(TEST_CFLAGS) -DVERSION='"test"' -DCLI_FAULT_INJECT cli.c test/cli_test.c -o test/cli_test
 	./test/cli_test
 	$(CC) $(TEST_CFLAGS) forward.c test/forward_test.c -o test/forward_test
 	./test/forward_test
-	$(CC) $(TEST_CFLAGS) hcl.c acl.c test/hcl_test.c -o test/hcl_test
-	./test/hcl_test
 
 # Coverage report for the unit-tested modules via llvm-cov.
 COVER_CFLAGS = $(TEST_CFLAGS) -fprofile-instr-generate -fcoverage-mapping
 .PHONY: cover
 cover:
 	rm -f *.profraw *.profdata
-	$(CC) $(COVER_CFLAGS) acl.c test/acl_test.c -o test/acl_test
-	LLVM_PROFILE_FILE=acl.profraw ./test/acl_test >/dev/null
-	$(CC) $(COVER_CFLAGS) conntrack.c test/conntrack_test.c -o test/conntrack_test
-	LLVM_PROFILE_FILE=conntrack.profraw ./test/conntrack_test >/dev/null
 	$(CC) $(COVER_CFLAGS) -DVERSION='"test"' -DCLI_FAULT_INJECT cli.c test/cli_test.c -o test/cli_test
 	LLVM_PROFILE_FILE=cli.profraw ./test/cli_test >/dev/null
 	$(CC) $(COVER_CFLAGS) forward.c test/forward_test.c -o test/forward_test
 	LLVM_PROFILE_FILE=forward.profraw ./test/forward_test >/dev/null
-	$(CC) $(COVER_CFLAGS) hcl.c acl.c test/hcl_test.c -o test/hcl_test
-	LLVM_PROFILE_FILE=hcl.profraw ./test/hcl_test >/dev/null
-	xcrun llvm-profdata merge -sparse acl.profraw -o acl.profdata
-	xcrun llvm-profdata merge -sparse conntrack.profraw -o conntrack.profdata
 	xcrun llvm-profdata merge -sparse cli.profraw -o cli.profdata
-	xcrun llvm-profdata merge -sparse forward.profraw -o forward.profdata
-	xcrun llvm-profdata merge -sparse hcl.profraw -o hcl.profdata
-	xcrun llvm-cov report ./test/acl_test -instr-profile=acl.profdata acl.c
-	xcrun llvm-cov report ./test/conntrack_test -instr-profile=conntrack.profdata conntrack.c
 	xcrun llvm-cov report ./test/cli_test -instr-profile=cli.profdata cli.c
+	xcrun llvm-profdata merge -sparse forward.profraw -o forward.profdata
 	xcrun llvm-cov report ./test/forward_test -instr-profile=forward.profdata forward.c
-	xcrun llvm-cov report ./test/hcl_test -instr-profile=hcl.profdata hcl.c
 
 define make_artifacts
 	$(MAKE) clean
