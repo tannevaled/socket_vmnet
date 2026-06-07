@@ -149,11 +149,20 @@ endif
 # socket_vmnet's own vmnet-independent units. The ACL / conntrack / HCL engines
 # now live in libfw/c-fw and are tested in that repo.
 .PHONY: test
-test: test.acl
+test: test.acl test.control
 	$(CC) $(TEST_CFLAGS) -DVERSION='"test"' -DCLI_FAULT_INJECT cli.c test/cli_test.c -o test/cli_test
 	./test/cli_test
 	$(CC) $(TEST_CFLAGS) forward.c test/forward_test.c -o test/forward_test
 	./test/forward_test
+
+# Offline unit test for the stats+control plane (control.c). Links the c-fw /
+# c-hcl sources directly; no vmnet, no root.
+.PHONY: test.control
+test.control:
+	$(CC) $(TEST_CFLAGS) -I$(CFW) -I$(CHCL) control.c $(CFW)/acl.c $(CFW)/acl_hcl.c \
+		$(CFW)/json.c $(CFW)/conntrack.c $(CHCL)/hcl.c $(CHCL)/ast.c test/control_test.c \
+		-o test/control_test
+	./test/control_test
 
 # Offline integration smoke for the ACL front-end: builds the daemon and checks
 # that good .hcl/.json rulesets load (and reach vmnet) while a malformed one

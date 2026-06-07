@@ -97,6 +97,10 @@ static void print_usage(const char *argv0) {
          "traffic is allowed\n");
   printf("                                    without an explicit reverse rule "
          "(requires --acl)\n");
+  printf("--control-socket=PATH               local UNIX socket exposing the "
+         "firewall\n");
+  printf("                                    stats + control plane (JSON) for "
+         "a UI\n");
   printf("-h, --help                          display this help and exit\n");
   printf("-v, --version                       display version information and "
          "exit\n");
@@ -121,6 +125,7 @@ enum {
   CLI_OPT_SOCKET_DGRAM,
   CLI_OPT_ACL,
   CLI_OPT_STATEFUL,
+  CLI_OPT_CONTROL_SOCKET,
 };
 
 struct cli_options *cli_options_parse(int argc, char *argv[]) {
@@ -145,6 +150,7 @@ struct cli_options *cli_options_parse(int argc, char *argv[]) {
       {"socket-dgram",             required_argument, NULL, CLI_OPT_SOCKET_DGRAM            },
       {"acl",                      required_argument, NULL, CLI_OPT_ACL                     },
       {"stateful",                 no_argument,       NULL, CLI_OPT_STATEFUL                },
+      {"control-socket",           required_argument, NULL, CLI_OPT_CONTROL_SOCKET          },
       {"pidfile",                  required_argument, NULL, 'p'                             },
       {"help",                     no_argument,       NULL, 'h'                             },
       {"version",                  no_argument,       NULL, 'v'                             },
@@ -209,6 +215,9 @@ struct cli_options *cli_options_parse(int argc, char *argv[]) {
       break;
     case CLI_OPT_STATEFUL:
       res->stateful = true;
+      break;
+    case CLI_OPT_CONTROL_SOCKET:
+      res->control_path = strdup(optarg);
       break;
     case 'p':
       res->pidfile = strdup(optarg);
@@ -309,5 +318,6 @@ void cli_options_destroy(struct cli_options *x) {
   free(x->pidfile);
   free(x->socket_dgram_path);
   free(x->acl_path);
+  free(x->control_path);
   free(x);
 }

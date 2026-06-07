@@ -45,6 +45,9 @@ struct cli_options {
   // --stateful; track TCP/UDP flows so return traffic of an allowed flow is
   // permitted without an explicit reverse rule. Requires --acl.
   bool stateful;
+  // --control-socket=PATH; a local UNIX socket exposing the firewall stats +
+  // control plane (JSON) for an out-of-process UI. NULL = disabled.
+  char *control_path;
   // arg (the positional SOCK_STREAM socket; legacy QEMU `-netdev socket`)
   char *socket_path;
 };

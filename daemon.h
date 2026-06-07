@@ -8,10 +8,10 @@
 #include <stdint.h>
 #include <vmnet/vmnet.h>
 
-#include "acl.h"      /* libfw/c-fw: enum acl_dir, struct acl */
-#include "cli.h"      /* struct cli_options */
+#include "acl.h"       /* libfw/c-fw: enum acl_dir, struct acl */
+#include "cli.h"       /* struct cli_options */
 #include "conntrack.h" /* struct conntrack */
-#include "forward.h"  /* struct conn */
+#include "forward.h"   /* struct conn */
 
 struct state {
   dispatch_semaphore_t sem;
@@ -32,6 +32,11 @@ struct state {
   struct acl *acl;
   // Optional connection tracker (--stateful). NULL = stateless.
   struct conntrack *ct;
+  // Raw source text of the current ACL (JSON or HCL), for the control plane's
+  // get_rules. Owned; swapped together with `acl`. NULL if no ACL.
+  char *acl_json;
+  // Optional stats+control plane (--control-socket). NULL = disabled.
+  struct control *control;
 };
 
 /* main.c: ACL/conntrack admission check for one frame. */

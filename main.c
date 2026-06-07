@@ -18,10 +18,11 @@
 #include <uuid/uuid.h>
 #include <vmnet/vmnet.h>
 
-#include "acl.h"      /* libfw/c-fw */
-#include "acl_hcl.h"  /* libfw/c-fw (HCL front-end, via libhcl/c-hcl) */
+#include "acl.h"     /* libfw/c-fw */
+#include "acl_hcl.h" /* libfw/c-fw (HCL front-end, via libhcl/c-hcl) */
 #include "cli.h"
 #include "conntrack.h" /* libfw/c-fw */
+#include "control.h"
 #include "forward.h"
 #include "log.h"
 
@@ -39,32 +40,26 @@ bool debug = false;
 // daemon.h. struct conn / enum transport come from forward.h.
 struct state _state;
 
-// Load an ACL from a file, choosing the format by extension: a `.hcl` path is
-// compiled by the built-in HCL parser, anything else is parsed as JSON.
-static struct acl *load_acl_file(const char *path) {
-  size_t n = strlen(path);
-  if (n >= 4 && strcmp(path + n - 4, ".hcl") == 0)
-    return acl_load_hcl(path);
-  return acl_load(path);
-}
-
 // Decide whether a frame is permitted by the ACL, consulting the connection
 // tracker first so that return traffic of an allowed flow passes. Safe to call
 // with no ACL (returns true). Takes state->sem (guards acl swap + conntrack).
+// Records the decision in the control plane's event ring (no-op if disabled).
 bool frame_allowed(struct state *state, enum acl_dir dir, const void *buf, uint32_t len) {
   if (state->acl == NULL)
     return true;
   uint64_t now = (uint64_t)time(NULL);
   bool allow;
+  int rule = -1; /* -1 = default action or conntrack-established */
   dispatch_semaphore_wait(state->sem, DISPATCH_TIME_FOREVER);
   if (state->ct != NULL && conntrack_established(state->ct, buf, len, now)) {
     allow = true;
   } else {
-    allow = acl_allows(state->acl, dir, buf, len);
+    allow = acl_check(state->acl, dir, buf, len, &rule);
     if (allow && state->ct != NULL)
       conntrack_record(state->ct, buf, len, now);
   }
   dispatch_semaphore_signal(state->sem);
+  control_record_event(state->control, dir, allow, rule, (const uint8_t *)buf, len, now);
   return allow;
 }
 
@@ -84,7 +79,6 @@ static void state_remove_conn(struct state *state, struct conn *target) {
   conn_list_remove(&state->conns, target);
   dispatch_semaphore_signal(state->sem);
 }
-
 
 static int socket_bindlisten(const char *socket_path, const char *socket_group, int type) {
   int fd = -1;
@@ -211,7 +205,6 @@ static int add_listen_fd(int kq, int fd) {
   }
   return 0;
 }
-
 
 // Forward a guest's frame to the other guests sharing the single interface
 // (Phase 1): switch to the owning client (or flood), never echoing the sender.
@@ -365,9 +358,11 @@ int main(int argc, char *argv[]) {
   if (state.isolated) {
     INFOF("%s", "Guest-to-guest isolation is enabled (--isolated)");
   }
+  // Created before loading the ACL: control_reload_acl swaps under this lock.
+  state.sem = dispatch_semaphore_create(1);
+
   if (cliopt->acl_path != NULL) {
-    state.acl = load_acl_file(cliopt->acl_path);
-    if (state.acl == NULL) {
+    if (!control_reload_acl(&state)) {
       // Error already logged. Fail closed: refuse to start rather than run
       // unfiltered when an ACL was explicitly requested.
       goto done;
@@ -384,8 +379,6 @@ int main(int argc, char *argv[]) {
   } else if (cliopt->stateful) {
     WARN("--stateful has no effect without --acl");
   }
-
-  state.sem = dispatch_semaphore_create(1);
 
   // Queue for vm connections, allowing processing vms requests in parallel.
   state.vms_queue =
@@ -412,6 +405,15 @@ int main(int argc, char *argv[]) {
     goto done;
   }
 
+  if (cliopt->control_path != NULL) {
+    state.control = control_start(&state, cliopt->control_path);
+    if (state.control == NULL) {
+      // Error already logged; fail to start rather than silently drop the
+      // explicitly-requested control plane.
+      goto done;
+    }
+  }
+
   while (1) {
     struct kevent events[1];
     int n = kevent(kq, NULL, 0, events, 1, NULL);
@@ -425,16 +427,8 @@ int main(int argc, char *argv[]) {
         // Hot-reload the ACL; keep the old ruleset (and connection state) if the
         // new file fails to parse.
         INFOF("%s", "Received SIGHUP, reloading ACL");
-        struct acl *fresh = load_acl_file(cliopt->acl_path);
-        if (fresh != NULL) {
-          dispatch_semaphore_wait(state.sem, DISPATCH_TIME_FOREVER);
-          struct acl *old = state.acl;
-          state.acl = fresh;
-          dispatch_semaphore_signal(state.sem);
-          acl_destroy(old);
-        } else {
+        if (!control_reload_acl(&state))
           ERROR("acl: reload failed; keeping the previous ruleset");
-        }
         continue;
       }
       INFOF("Received signal %s", strsignal(events[0].ident));
@@ -475,7 +469,10 @@ done:
     close(dgram_fd);
   }
   free(dgram_buf);
+  if (state.control != NULL)
+    control_stop(state.control);
   acl_destroy(state.acl);
+  free(state.acl_json);
   conntrack_free(state.ct);
   if (pidfile_fd != -1) {
     remove_pidfile(cliopt->pidfile);
