@@ -28,7 +28,7 @@ CFLAGS += -DVERSION=\"$(VERSION)\"
 CFW := third_party/c-fw
 CHCL := $(CFW)/third_party/c-hcl
 CFLAGS += -I$(CFW) -I$(CHCL)
-CFW_OBJS := $(CFW)/acl.o $(CFW)/json.o $(CFW)/conntrack.o $(CFW)/acl_hcl.o $(CHCL)/hcl.o
+CFW_OBJS := $(CFW)/acl.o $(CFW)/json.o $(CFW)/conntrack.o $(CFW)/acl_hcl.o $(CHCL)/hcl.o $(CHCL)/ast.o
 
 LDFLAGS ?=
 VMNET_LDFLAGS = -framework vmnet
