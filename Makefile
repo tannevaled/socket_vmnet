@@ -164,6 +164,14 @@ test.control:
 		-o test/control_test
 	./test/control_test
 
+# Standalone control-plane server for fw-ui's cross-language compat test. Links
+# the real control.c + c-fw + c-hcl (no vmnet); serves until signalled.
+.PHONY: control-harness
+control-harness:
+	$(CC) $(TEST_CFLAGS) -I$(CFW) -I$(CHCL) control.c $(CFW)/acl.c $(CFW)/acl_hcl.c \
+		$(CFW)/json.c $(CFW)/conntrack.c $(CHCL)/hcl.c $(CHCL)/ast.c test/control_harness.c \
+		-o test/control_harness
+
 # Offline integration smoke for the ACL front-end: builds the daemon and checks
 # that good .hcl/.json rulesets load (and reach vmnet) while a malformed one
 # fails closed. Needs the vmnet framework to link, but no root. The full
