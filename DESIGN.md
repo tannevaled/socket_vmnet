@@ -151,6 +151,21 @@ Now implemented on top of the stateless base:
   `proto = "icmpv6"` added.
 - **SIGHUP reload** — the daemon hot-reloads `--acl` in place, keeping the old
   ruleset and connection state if the new file fails to parse.
+- **Observability + control plane (`--control-socket`)** — `control.c` serves a
+  line-delimited JSON protocol on a local UNIX socket from a dedicated thread
+  (synchronized through the same `state->sem`, so the kqueue/dispatch packet
+  loop is untouched): live ACL/conntrack counters, per-rule hit counts and a
+  recent-decision **event ring**, plus live ruleset edit (`set_acl`) and
+  `reload`. `frame_allowed` uses `acl_check` to record each decision (with its
+  matched rule index) into the ring. Consumed by the
+  [`fw-ui`](https://github.com/libfw/fw-ui) web UI; protocol documented in
+  [`ACL.md`](ACL.md).
+
+The ACL matcher, connection tracker and HCL front-end now live in the reusable
+**[libfw/c-fw](https://github.com/libfw/c-fw)** library (vendored as a
+submodule under `third_party/c-fw`, which in turn vendors
+[libhcl/c-hcl](https://github.com/libhcl/c-hcl)); the daemon links them and adds
+only the vmnet glue + the control plane.
 
 Follow-ups: stateful ICMP, IPv6 extension-header walking, configurable timeouts.
 

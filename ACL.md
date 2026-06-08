@@ -127,6 +127,55 @@ kill -HUP "$(cat /var/run/socket_vmnet.pid)"
 If the new file fails to parse, the previous ruleset (and connection state) is
 kept and an error is logged.
 
+## Control plane (`--control-socket`)
+
+`--control-socket=PATH` opens a local `AF_UNIX` stream socket exposing a small
+**stats + control plane** for observing the firewall in real time and editing
+the ruleset live. It is what the [`fw-ui`](https://github.com/libfw/fw-ui) web UI
+connects to; the daemon itself never speaks HTTP.
+
+```bash
+socket_vmnet --acl=/etc/socket_vmnet/acl.hcl \
+             --control-socket=/var/run/socket_vmnet.control \
+             /var/run/socket_vmnet
+```
+
+**Protocol.** Line-delimited JSON: each request is one `\n`-terminated JSON
+object, each reply one `\n`-terminated object with `"ok": true|false` (and
+`"error"` on failure). Commands:
+
+| request | reply |
+|---------|-------|
+| `{"cmd":"get_stats"}` | ACL counters (`allow`/`deny` frames + bytes per direction, `nonip`), per-rule `hits`, and conntrack `capacity`/`live`/`lookups`/`hits`/`inserts` |
+| `{"cmd":"get_events","since":SEQ}` | recent allow/deny decisions with seq `>= SEQ`, plus `next`; each carries `dir`, `verdict`, matched `rule` (−1 = default / conntrack), `proto`, `src`/`dst`/`sport`/`dport`, `len`, `ts` |
+| `{"cmd":"get_rules"}` | the current ruleset `source` text and `format` (`json`/`hcl`) |
+| `{"cmd":"set_acl","json":"…"}` | compile the JSON ruleset and hot-swap it atomically (the old ACL is kept on a parse error) |
+| `{"cmd":"reload"}` | re-read the `--acl` file (same as `SIGHUP`) |
+| `{"cmd":"reset_stats"}` | zero the counters |
+
+Example:
+
+```console
+$ nc -U /var/run/socket_vmnet.control
+{"cmd":"get_stats"}
+{"ok":true,"acl":{"egress":{"allow":42,"deny":3,...},"ingress":{...}},"rules":[{"index":0,"hits":42}],"conntrack":{"capacity":4096,"live":7,...}}
+```
+
+**Internals.** The server runs on a dedicated thread and synchronizes with the
+data path through the same `state->sem` that guards the ACL swap and conntrack,
+so it never touches the kqueue/dispatch packet loop. Each admission decision in
+`frame_allowed` is appended to a fixed-size in-memory **event ring** (the
+matched rule index comes from `acl_check`); `get_events` serves a window of it
+by sequence number. Counters live in the c-fw ACL/conntrack objects (see
+[libfw/c-fw](https://github.com/libfw/c-fw)). The protocol handler
+(`control_handle`) is a pure function and is unit-tested offline
+(`make test.control`), and the wire contract is checked end to end against the
+Go client in `fw-ui` (`make control-harness` + fw-ui's `-tags=compat` suite).
+
+> The control socket grants full read **and write** access to the firewall
+> ruleset; protect it with filesystem permissions (it is created `0660`) and do
+> not expose it to untrusted local users.
+
 ## Limitations
 
 - **No fragments / no L4 options.** Ports are read from the first L4 header; IP
